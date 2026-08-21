@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+# avo — AVO-lite: a harness-agnostic self-improving-loop scaffold.
+# Core = shell + git + jsonl. The agent and the scorer are pluggable commands.
+# See the avo-lite skill for the method and harness bindings.
+#
+# Usage:
+#   avo init <task> --goal STR --score CMD [--agent CMD] [--verify CMD]
+#                   [--k DIR] [--mode rank|discover]
+#   avo tick                 # one locked iteration (safe under overlapping schedulers)
+#   avo run [--max-ticks N] [--until-stagnant] [--sleep SECONDS]
+#   avo supervise            # expensive-model trajectory review -> redirect.json
+#   avo status               # read-only summary
+#   avo report               # redacted noteworthy-only summary
+#
+# Env overrides (win over avo.toml / .avo/config.json): AVO_AGENT_CMD, AVO_SCORE_CMD,
+#   AVO_VERIFY_CMD (empty value disables), AVO_DRIVER_MODEL, AVO_SUPERVISOR_MODEL.
+
+set -o pipefail
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+LIB="$SELF_DIR/lib"
+# shellcheck source=/dev/null
+. "$LIB/common.sh"; . "$LIB/ledger.sh"; . "$LIB/context.sh"; . "$LIB/ratchet.sh"; . "$LIB/redact.sh"
+
+need git; need jq
+
+# ---------------------------------------------------------------------------
+cmd_init() {
+  local task="" goal="" score="" agent="" verify="" kdir="" mode="rank"
+  task="$1"; shift || true
+  [ -n "$task" ] || die "usage: avo init <task> --goal STR --score CMD [...]"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --goal)   goal="$2"; shift 2;;
+      --score)  score="$2"; shift 2;;
+      --agent)  agent="$2"; shift 2;;
+      --verify) verify="$2"; shift 2;;
+      --k)      kdir="$2"; shift 2;;
+      --mode)   mode="$2"; shift 2;;
+      *) die "unknown init flag: $1";;
+    esac
+  done
+  [ -n "$goal" ]  || die "provide --goal (what the scorer's objective means)."
+  case "$mode" in rank|discover) : ;; *) die "--mode must be rank or discover";; esac
+  local preview=0
+  if [ -z "$score" ]; then
+    preview=1
+    warn "no --score given: initializing in PREVIEW mode (agent runs, nothing is scored or kept)."
+    warn "add a scorer later via .avo/config.json or AVO_SCORE_CMD to start a real loop."
+  fi
+
+  git rev-parse --show-toplevel >/dev/null 2>&1 || { git init -q; info "git-init'd $(pwd)"; }
+  # Fail fast before creating anything (branch/dirs) if a task already lives here.
+  [ -f "$AVO_CONFIG" ] && die "$AVO_CONFIG already exists here; refusing to overwrite an initialized task."
+  # Warn (don't block) if uncommitted work would be swept into baseline v0.
+  local wip; wip=$(git status --porcelain --untracked-files=all 2>/dev/null | grep -v -e '^!! ' || true)
+  [ -n "$wip" ] && warn "note: uncommitted changes will be captured into baseline v0:
+$wip"
+
+  local branch="avo/$task"
+  git rev-parse --verify "$branch" >/dev/null 2>&1 && git checkout -q "$branch" || git checkout -q -b "$branch"
+  mkdir -p "$AVO_DIR/prompts" "$AVO_DIR/runs" K
+  acquire_lock
+
+  # Keep ALL scaffold state out of the candidate tree (candidate = solution files only).
+  # avo.toml, .avo/, and ledger.jsonl are local control state, not versioned candidate content —
+  # so editing config never dirties the tree and never blocks a tick.
+  touch .gitignore
+  grep -qxF '/.avo/'        .gitignore || echo '/.avo/'        >> .gitignore
+  grep -qxF '/ledger.jsonl' .gitignore || echo '/ledger.jsonl' >> .gitignore
+  grep -qxF '/avo.toml'     .gitignore || echo '/avo.toml'     >> .gitignore
+  if git ls-files --error-unmatch -- .avo ledger.jsonl avo.toml >/dev/null 2>&1; then
+    die "refusing to init: .avo, ledger.jsonl, or avo.toml is already git-tracked; untrack first (git rm --cached -r .avo ledger.jsonl avo.toml)."
+  fi
+  { git check-ignore -q .avo/x && git check-ignore -q ledger.jsonl && git check-ignore -q avo.toml; } 2>/dev/null \
+    || warn "warning: .gitignore may not cover avo control files"
+
+  # Free-text (commands, goal) live in JSON (quote-safe), never in TOML.
+  jq -n --arg a "${agent:-claude -p}" --arg s "$score" --arg v "$verify" --arg g "$goal" \
+    '{cmd:{agent:$a, score:$s, verify:$v}, goal:$g}' > "$AVO_CMDS"
+
+  # avo.toml holds only constrained scalar knobs. Comments on their own lines so parsers never see them inline.
+  cat > "$AVO_CONFIG" <<EOF
+# AVO-lite task config (constrained scalar knobs only; goal + commands live in .avo/config.json).
+# Env AVO_*_CMD / AVO_*_MODEL override these.
+mode = "$mode"
+
+[model]
+# Passed to your agent adapter as AVO_DRIVER_MODEL / AVO_SUPERVISOR_MODEL. Empty = the adapter's
+# own default. driver: cheap, runs every tick. supervisor: rare; use your strongest model.
+# e.g. driver = "haiku"  /  "glm-5.3"  /  "gpt-5-mini"   ;   supervisor = "opus" / "sonnet"
+driver = ""
+supervisor = ""
+
+[search]
+# lineage lines fed back as context
+context_entries = 6
+# ratchet floor in objective units (must be >= 0)
+min_improvement_abs = 0
+# ticks (candidate attempts) since last accept -> stall
+stall_window = 8
+# window of candidate attempts for unproductive-cycle + repeat-edit checks
+cycle_window = 10
+# reject-ratio over a full cycle_window that counts as unproductive
+reject_ratio = 0.8
+# accepts' cumulative delta over cycle_window below this * |best| -> unproductive
+min_cycle_delta_pct = 0.01
+# same diff_hash >= this many times in the window -> repeat edits
+repeat_edit_max = 3
+# min candidate attempts after a redirect before the supervisor may fire again
+supervisor_cooldown = 4
+# non-zero agent exit is a tick error by default. set true to score the tree anyway if a diff exists
+# (useful for agents like 'claude -p' that exit non-zero on max-turns but still did useful work).
+score_on_agent_error = false
+
+[report]
+# uncomment to report a new best only at/above this objective. left unset = always report a new best.
+# (do NOT set to 0 for negated lower-is-better objectives — that would silence every report.)
+# notify_min_objective = 0
+EOF
+
+  cat > "$AVO_DIR/prompts/driver.md" <<'EOF'
+You are the AVO-lite variation operator. One agent run = one variation step.
+Read the current best version, the recent lineage (successes and failures), and the
+knowledge base index. Then make one focused, coherent improvement to the working tree.
+Test and diagnose as much as you need internally. Do NOT git commit — the scaffold scores
+and commits. Never push. Never switch branches. Stay on this branch.
+EOF
+  cat > "$AVO_DIR/prompts/supervisor.md" <<'EOF'
+You are the AVO-lite supervisor. The driver has stalled. Review the WHOLE trajectory
+(all accepted versions + notes, the current plateau, and the trigger). Propose 2-4 fresh,
+concrete candidate directions that break the current pattern. If a local optimum is likely,
+name an ancestor commit to re-base exploration on. Output ONLY the redirect JSON described.
+Do not edit code, do not commit, do not switch branches.
+EOF
+
+  [ -n "$kdir" ] && [ -d "$kdir" ] && cp -R "$kdir/." K/ 2>/dev/null || true
+  [ -f K/INDEX.md ] || cat > K/INDEX.md <<'EOF'
+# Knowledge base (K)
+# One line per doc: relative/path — what it is for. The agent reads these on demand.
+EOF
+
+  printf '{}' > "$AVO_STATE"
+  state_set tick=0 best_objective=null 'best_commit="null"' stall=0 preview="$preview" \
+    "task_branch=\"$branch\"" last_supervised_tick=0 'last_action="init"'
+
+  # baseline commit (v0) — the seed candidate.
+  git add -A
+  local parent="null"
+  git rev-parse HEAD >/dev/null 2>&1 && parent=$(git rev-parse HEAD)
+  git commit -q -m "avo: init task '$task' (baseline v0)" >/dev/null 2>&1 \
+    || die "baseline commit failed (git identity? empty tree?). Fix and re-init."
+  local base; base=$(git rev-parse --short HEAD)
+
+  # Score the baseline so the ratchet has a real reference (spec: scored v0). Never die here —
+  # a bad/failing baseline score leaves the lineage unseeded (first correct tick seeds it), which is
+  # a documented, recoverable state; dying would strand a half-initialized task.
+  if [ "$preview" -eq 0 ]; then
+    local sc="$AVO_DIR/runs/0"; mkdir -p "$sc"
+    local SCORE; SCORE=$(getcmd score)
+    info "scoring baseline v0"
+    if sh -c "$SCORE \"\$1\"" _ "$(pwd)" > "$sc/score.json" 2>"$sc/score.err" && validate_score_ok "$sc/score.json" "$mode"; then
+      git notes --ref=avo add -f -m "$(jq -c . "$sc/score.json")" HEAD >/dev/null 2>&1 || true
+      local bobj; bobj=$(jq -r '.objective // "null"' "$sc/score.json")
+      [ "$bobj" != "null" ] && state_set best_objective="$bobj"
+      state_set "best_commit=\"$base\""
+      ledger_append tick=0 action='baseline' correct="$(jq -r '.correct' "$sc/score.json")" \
+        objective="$bobj" delta=0 note="$(jq -r '.note // "baseline"' "$sc/score.json")" \
+        commit="$base" parent="$parent" diff_hash="baseline" agent_model="" \
+        metrics="$(jq -c '.metrics // {}' "$sc/score.json")"
+      info "baseline scored: objective=$bobj"
+    else
+      warn "baseline scorer failed or produced an invalid score; leaving best unscored (first correct tick seeds the lineage)."
+    fi
+  fi
+  info "initialized task '$task' on branch $branch (baseline $base)."
+  [ "$preview" -eq 1 ] && info "PREVIEW mode: 'avo tick' will run the agent but keep nothing until you set a scorer." || info "Run: avo tick"
+}
+
+# ---------------------------------------------------------------------------
+cmd_tick() {
+  while [ $# -gt 0 ]; do case "$1" in --allow-dirty) AVO_ALLOW_DIRTY=1; shift;; *) die "unknown tick flag: $1";; esac; done
+  require_task_root; acquire_lock; require_branch; require_clean_tree
+  local mode; mode=$(cfg_or '' mode rank)
+  local tick; tick=$(( $(state_get tick 0) + 1 ))
+  local rundir="$AVO_DIR/runs/$tick"; mkdir -p "$rundir"
+  local parent; parent=$(git rev-parse HEAD 2>/dev/null || echo "null")
+
+  local AGENT SCORE VERIFY DMODEL preview
+  AGENT=$(getcmd agent); SCORE=$(getcmd score); VERIFY=$(getcmd verify)
+  DMODEL=$(resolve_model driver)
+  preview=$(state_get preview 0)
+  [ -n "$AGENT" ] || die "no agent command configured."
+  [ -n "$SCORE" ] || [ "$preview" = "1" ] || die "no score command configured (set .avo/config.json or AVO_SCORE_CMD)."
+
+  # snapshot pre-existing untracked files so a reject-clean never deletes the user's own files
+  AVO_PRE_UNTRACKED="$rundir/pre_untracked.txt"
+  git ls-files --others --exclude-standard > "$AVO_PRE_UNTRACKED" 2>/dev/null || : > "$AVO_PRE_UNTRACKED"
+
+  # consume any supervisor redirect ATOMICALLY (at-most-once, even across a crash)
+  local redir=""
+  if [ -f "$AVO_REDIRECT" ]; then
+    redir="$rundir/redirect.consumed.json"
+    mv "$AVO_REDIRECT" "$redir"
+    state_set redirect_consumed_tick="$tick"
+  fi
+
+  state_set tick="$tick"
+
+  # 1. context
+  local prompt="$rundir/prompt.md"
+  build_context "$prompt" "$redir"
+
+  # 2. variation — agent owns its inner loop
+  info "tick $tick: running agent (model=${DMODEL:-default})"
+  AVO_TICK="$tick" AVO_DRIVER_MODEL="$DMODEL" \
+    sh -c "$AGENT \"\$1\" \"\$2\"" _ "$(pwd)" "$prompt" > "$rundir/agent.stdout" 2>&1
+  local agent_rc=$?
+
+  # stage candidate (ignored .avo/ledger excluded), capture full diff incl. new files
+  git add -A
+  git diff --cached HEAD > "$rundir/diff.patch" 2>/dev/null || true
+  local diff_hash; diff_hash=$(git diff --cached HEAD | git hash-object --stdin 2>/dev/null | cut -c1-12)
+  [ -n "$diff_hash" ] || diff_hash="nodiff"
+
+  # preview mode: show what the agent would do, keep nothing
+  if [ "$preview" = "1" ]; then
+    info "tick $tick: PREVIEW (agent ran; diff saved to $rundir/diff.patch; nothing scored or kept)"
+    reset_candidate
+    ledger_append tick="$tick" action='preview' correct=null objective=null delta=0 \
+      note="preview: agent_rc=$agent_rc" parent="$parent" diff_hash="$diff_hash" agent_model="$DMODEL"
+    state_set 'last_action="preview"'
+    return 0
+  fi
+
+  # agent failure => error by default: do NOT score a half-finished tree, do NOT count as stall.
+  # score_on_agent_error=true scores the tree anyway iff the agent produced a diff.
+  if [ "$agent_rc" -ne 0 ] && { [ "$(cfg_or search score_on_agent_error false)" != "true" ] || [ "$diff_hash" = "nodiff" ]; }; then
+    warn "tick $tick: agent exited $agent_rc — recording error (not scored)"
+    reset_candidate
+    ledger_append tick="$tick" action='error' correct=null objective=null delta=0 \
+      note="agent exited $agent_rc" parent="$parent" diff_hash="$diff_hash" agent_model="$DMODEL"
+    state_set 'last_action="error"'
+    report_event "tick $tick error: agent exited $agent_rc"
+    return 0
+  fi
+  [ "$agent_rc" -ne 0 ] && warn "tick $tick: agent exited $agent_rc but score_on_agent_error=true and a diff exists — scoring anyway"
+
+  # 3. evaluation
+  info "tick $tick: scoring"
+  local scorefile="$rundir/score.json"
+  if ! sh -c "$SCORE \"\$1\"" _ "$(pwd)" > "$scorefile" 2>"$rundir/score.err"; then
+    warn "tick $tick: score command failed (infra) — recording error, not a correctness fail"
+    reset_candidate
+    ledger_append tick="$tick" action='error' correct=null objective=null delta=0 \
+      note="score command infra failure" parent="$parent" diff_hash="$diff_hash" agent_model="$DMODEL"
+    state_set 'last_action="error"'
+    report_event "tick $tick error: scorer infra failure"
+    maybe_supervise "$tick"; return 0
+  fi
+  validate_score "$scorefile" "$mode"
+  copy_artifacts "$scorefile" "$rundir"
+
+  # optional independent verify (falsification pass)
+  local verify_ok=1 verify_json=null
+  if [ -n "$VERIFY" ] && [ "$(jq -r '.correct' "$scorefile")" = "true" ]; then
+    if sh -c "$VERIFY \"\$1\"" _ "$(pwd)" > "$rundir/verify.txt" 2>&1; then verify_ok=1; verify_json=true
+    else verify_ok=0; verify_json=false; fi
+  fi
+
+  # 4. ratchet
+  local decision; decision=$(decide_accept "$scorefile")
+  [ "$verify_ok" -eq 1 ] || decision=reject
+  local correct obj delta note metrics
+  correct=$(jq -r '.correct' "$scorefile")
+  obj=$(jq -r '(.objective // "null")' "$scorefile")
+  delta=$(score_delta "$scorefile")
+  note=$(jq -r '.note // ""' "$scorefile")
+  metrics=$(jq -c '.metrics // {}' "$scorefile")
+
+  if [ "$decision" = "accept" ]; then
+    local commit
+    if ! commit=$(commit_candidate "$scorefile" "$note" "$parent"); then
+      warn "tick $tick: accept decided but commit failed — recording error"
+      reset_candidate
+      ledger_append tick="$tick" action='error' correct="$correct" objective="$obj" delta=0 \
+        note="commit failed: $note" parent="$parent" diff_hash="$diff_hash" agent_model="$DMODEL" \
+        metrics="$metrics" verify="$verify_json"
+      state_set 'last_action="error"'
+      report_event "tick $tick error: commit failed"
+      return 0
+    fi
+    if [ "$obj" != "null" ]; then
+      local best; best=$(state_get best_objective null)
+      if [ "$best" = "null" ] || jq -n --argjson o "$obj" --argjson b "$best" -e '$o>$b' >/dev/null; then
+        state_set best_objective="$obj"
+      fi
+    fi
+    state_set "best_commit=\"$commit\"" stall=0 'last_action="accept"'
+    ledger_append tick="$tick" action='accept' correct="$correct" objective="$obj" delta="$delta" \
+      note="$note" commit="$commit" parent="$parent" diff_hash="$diff_hash" agent_model="$DMODEL" \
+      metrics="$metrics" verify="$verify_json"
+    info "tick $tick: ACCEPT objective=$obj (delta=$delta) commit=$commit"
+    report_best "$obj" "$commit" "$note"
+  else
+    reset_candidate
+    local stall; stall=$(( $(state_get stall 0) + 1 ))
+    state_set stall="$stall" 'last_action="reject"'
+    ledger_append tick="$tick" action='reject' correct="$correct" objective="$obj" delta="$delta" \
+      note="$note" parent="$parent" diff_hash="$diff_hash" agent_model="$DMODEL" \
+      metrics="$metrics" verify="$verify_json"
+    info "tick $tick: reject (correct=$correct verify=$verify_json objective=$obj stall=$stall)"
+  fi
+
+  maybe_supervise "$tick"
+}
+
+# restore candidate to HEAD. Removes ONLY untracked files created during this tick — pre-existing
+# untracked user files (snapshotted in $AVO_PRE_UNTRACKED) and all avo control files are preserved.
+remove_new_untracked() {
+  git ls-files --others --exclude-standard 2>/dev/null | while IFS= read -r f; do
+    case "$f" in .avo/*|ledger.jsonl|avo.toml|.gitignore) continue ;; esac
+    if [ -f "$AVO_PRE_UNTRACKED" ] && grep -qxF "$f" "$AVO_PRE_UNTRACKED" 2>/dev/null; then continue; fi
+    rm -f "$f" 2>/dev/null
+  done
+}
+reset_candidate() {
+  git reset -q --hard HEAD 2>/dev/null   # restores tracked files
+  remove_new_untracked                    # removes this tick's new untracked files only
+}
+
+copy_artifacts() {  # <score.json> <rundir> ; relative, in-tree paths only
+  local scorefile="$1" rundir="$2" a
+  jq -r '.artifacts[]? // empty' "$scorefile" 2>/dev/null | while IFS= read -r a; do
+    case "$a" in /*|*..*) warn "skipping unsafe artifact path: $a"; continue;; esac
+    if [ -f "$a" ]; then mkdir -p "$rundir/artifacts"; cp "$a" "$rundir/artifacts/" 2>/dev/null || true; fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# stall detection: single source of truth is avo-stall-detect. Prints reason or nothing.
+detect_stall() { "$SELF_DIR/avo-stall-detect" --ledger "$AVO_LEDGER" 2>/dev/null; }
+
+maybe_supervise() {
+  local tick="$1" reason; reason=$(detect_stall)
+  [ -n "$reason" ] || return 0
+  warn "stall detected -> $reason"
+  local last_sup cooldown
+  last_sup=$(state_get last_supervised_tick 0)
+  cooldown=$(cfg_num search supervisor_cooldown 4)
+  if [ "$last_sup" != "0" ] && [ "$(( tick - last_sup ))" -lt "$cooldown" ]; then
+    warn "supervisor cooldown active ($((tick - last_sup))/$cooldown attempts since last redirect); leaving for human review"
+    report_event "stalled and in cooldown: $reason"
+    state_set 'last_action="stalled_cooldown"'
+    return 0
+  fi
+  cmd_supervise "$reason"
+}
+
+# ---------------------------------------------------------------------------
+cmd_supervise() {
+  require_task_root
+  acquire_lock; require_branch    # re-entrant: no-op if the calling tick already holds the lock
+  # ensure an untracked snapshot exists so remove_new_untracked can't delete user files on direct invocation
+  if [ -z "$AVO_PRE_UNTRACKED" ] || [ ! -f "$AVO_PRE_UNTRACKED" ]; then
+    AVO_PRE_UNTRACKED="$AVO_DIR/runs/supervise-pre_untracked.txt"
+    git ls-files --others --exclude-standard > "$AVO_PRE_UNTRACKED" 2>/dev/null || : > "$AVO_PRE_UNTRACKED"
+  fi
+  local reason="${1:-manual}"
+  local SMODEL AGENT tick before_head
+  SMODEL=$(resolve_model supervisor); AGENT=$(getcmd agent)
+  tick=$(state_get tick 0); before_head=$(git rev-parse HEAD 2>/dev/null)
+
+  local sp="$AVO_DIR/runs/supervise-$tick.prompt.md"
+  {
+    cat "$AVO_DIR/prompts/supervisor.md"
+    echo; echo "## Goal"; get_goal; echo
+    echo; echo "## Trigger"; echo "$reason"
+    echo; echo "## Accepted trajectory (committed versions)"
+    grep '"action":"accept"' "$AVO_LEDGER" 2>/dev/null | jq -r '"- t\(.tick) obj=\(.objective) d=\(.delta)  \(.note)"'
+    echo; echo "## Knowledge base"; cat K/INDEX.md 2>/dev/null
+    cat <<'EOF'
+
+## Output — the LAST line of your reply must be ONE single-line JSON object, exactly this shape:
+{"directions": ["fresh direction 1", "fresh direction 2"], "rebase": ""}
+Any reasoning may precede it, but the final line must be that JSON alone. Do not pretty-print it.
+EOF
+  } > "$sp"
+
+  info "supervising (model=$SMODEL): $reason"
+  local out="$AVO_DIR/runs/supervise-$tick.out"
+  AVO_SUPERVISOR_MODEL="$SMODEL" sh -c "$AGENT \"\$1\" \"\$2\"" _ "$(pwd)" "$sp" > "$out" 2>"$AVO_DIR/runs/supervise-$tick.err"
+
+  # supervisor must not mutate the repo
+  if [ "$(git rev-parse HEAD 2>/dev/null)" != "$before_head" ]; then
+    warn "supervisor moved HEAD; resetting (supervisor must not commit)"; git reset -q --hard "$before_head"
+  fi
+  remove_new_untracked
+
+  # Extract a redirect object tolerantly (real agents wrap JSON in prose), then validate it.
+  local redirect_json; redirect_json=$(extract_redirect "$out")
+  if [ -z "$redirect_json" ]; then
+    warn "supervisor produced no valid redirect JSON (see $out); no redirect written"
+    state_set last_supervised_tick="$tick"    # count the attempt so cooldown still applies
+    return 0
+  fi
+  printf '%s' "$redirect_json" | jq -c '{directions:.directions, rebase:(.rebase // "")}' > "$AVO_REDIRECT"
+  state_set stall=0 last_supervised_tick="$tick" 'last_action="redirect"'
+  ledger_append tick="$tick" action='redirect' correct=null objective=null delta=0 \
+    note="redirect: $reason" diff_hash="redirect" agent_model="$SMODEL"
+  info "redirect written: $(jq -c '.directions' "$AVO_REDIRECT")"
+  report_event "supervisor redirect ($reason): $(jq -c '.directions' "$AVO_REDIRECT")"
+}
+
+# extract_redirect <agent-stdout-file> : print a validated single-line redirect JSON, or nothing.
+# Tries: (1) whole file is one object; (2) the last single line that parses as an object with a
+# non-empty string[] `directions`. Tolerates reasoning prose around the JSON.
+extract_redirect() {
+  local out="$1" cand=""
+  local valid='type=="object" and (.directions|type=="array") and (.directions|length>=1) and (all(.directions[]; type=="string" and length>0))'
+  if [ "$(jq -s 'length' "$out" 2>/dev/null)" = "1" ] && jq -e "$valid" "$out" >/dev/null 2>&1; then
+    jq -c . "$out"; return
+  fi
+  local line
+  while IFS= read -r line; do
+    case "$line" in *'{'*'}'*) : ;; *) continue ;; esac
+    if printf '%s' "$line" | jq -e "$valid" >/dev/null 2>&1; then cand="$line"; fi
+  done < "$out"
+  [ -n "$cand" ] && printf '%s' "$cand"
+}
+
+# ---------------------------------------------------------------------------
+cmd_run() {
+  require_task_root
+  local max="" until_stag=0 sleep_s=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --max-ticks) max="$2"; shift 2;;
+      --until-stagnant) until_stag=1; shift;;
+      --sleep) sleep_s="$2"; shift 2;;
+      --allow-dirty) AVO_ALLOW_DIRTY=1; shift;;
+      *) die "unknown run flag: $1";;
+    esac
+  done
+  # Default to a bounded run so a bare `avo run` can't loop forever burning paid calls.
+  # --max-ticks 0 means explicitly unbounded; --until-stagnant also removes the count bound.
+  [ -n "$max" ] || { [ "$until_stag" -eq 1 ] && max=0 || max=20; }
+  [ "$max" = "20" ] && info "bounded run: --max-ticks 20 (pass --max-ticks 0 for unbounded)"
+  local n=0
+  while :; do
+    cmd_tick
+    n=$((n+1))
+    [ "$max" -gt 0 ] && [ "$n" -ge "$max" ] && { info "reached max-ticks $max"; break; }
+    # Stop only once the supervisor has been TRIED and the search is still stuck (stalled in cooldown),
+    # not the moment a redirect is produced — the next tick must get to consume it (invariant 6).
+    if [ "$until_stag" -eq 1 ] && [ "$(state_get last_action '""'|tr -d '"')" = "stalled_cooldown" ]; then
+      info "stopping: stalled after a supervisor redirect (still stuck)"; break
+    fi
+    [ "$sleep_s" -gt 0 ] && sleep "$sleep_s"
+  done
+}
+
+# ---------------------------------------------------------------------------
+cmd_status() {
+  require_task_root
+  local best obj commit tick stall mode
+  tick=$(state_get tick 0); best=$(state_get best_objective null)
+  commit=$(state_get best_commit '""'|tr -d '"'); stall=$(state_get stall 0)
+  mode=$(cfg_or '' mode rank)
+  [ "$(state_get preview 0)" = "1" ] && echo "*** PREVIEW MODE — no scorer configured; ticks run the agent but keep nothing. Set a scorer to start a real loop. ***"
+  echo "task branch : $(git rev-parse --abbrev-ref HEAD 2>/dev/null) (expected $(state_get task_branch '""'|tr -d '"'))"
+  echo "mode        : $mode"
+  echo "ticks       : $tick"
+  echo "best objective: $best  (commit $commit)"
+  echo "stall counter : $stall"
+  local reason; reason=$(detect_stall); [ -n "$reason" ] && echo "STALL: $reason"
+  echo "--- last ledger entries ---"
+  last_n_ledger 8 | jq -r '"t\(.tick)\t\(.action)\tcorrect=\(.correct)\tobj=\(.objective // "-")\t\(.note // "")"' 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# reporting: silent-on-success; fire on new best / stall / errors. Redacted.
+report_best() {
+  local obj="$1" commit="$2" note="$3" thr
+  [ "$obj" = "null" ] && return 0
+  thr=$(cfg report notify_min_objective)   # unset/empty => always report (works for negated objectives)
+  if [ -n "$thr" ]; then
+    jq -n --argjson o "$obj" --argjson t "$thr" -e '$o >= $t' >/dev/null 2>&1 || return 0
+  fi
+  { echo "[$(now_iso)] AVO new best: objective=$obj commit=$commit"; echo "  $note"; } | redact >> "$AVO_DIR/report.log"
+}
+report_event() { { echo "[$(now_iso)] $* (branch $(git rev-parse --abbrev-ref HEAD 2>/dev/null))"; } | redact >> "$AVO_DIR/report.log"; }
+cmd_report() { require_task_root; [ -f "$AVO_DIR/report.log" ] && cat "$AVO_DIR/report.log" || echo "(nothing noteworthy)"; }
+
+# ---------------------------------------------------------------------------
+main() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    init)      cmd_init "$@";;
+    tick)      cmd_tick "$@";;
+    run)       cmd_run "$@";;
+    supervise) cmd_supervise "$@";;
+    status)    cmd_status "$@";;
+    report)    cmd_report "$@";;
+    ""|-h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//';;
+    *) die "unknown command: $sub (try: init tick run supervise status report)";;
+  esac
+}
+main "$@"

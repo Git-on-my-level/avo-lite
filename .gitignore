@@ -1,0 +1,6 @@
+# avo-lite creates these per task; never commit example runs
+.avo/
+ledger.jsonl
+# example/test task dirs
+/example/
+/scratch/

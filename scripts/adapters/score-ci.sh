@@ -1,31 +1,32 @@
 #!/usr/bin/env bash
-# Example scorer (rank mode, optimization-shaped): wrap a CI/test suite + a metric.
-# Contract: <candidate-dir> -> one score JSON on stdout; exit 0 = evaluation completed,
-# non-zero = infra failure. Correctness = tests pass (hard gate). Objective = a
-# higher-is-better number. In rank mode a numeric objective is REQUIRED, so AVO_METRIC_CMD
-# is mandatory here — otherwise every correct tick would be rejected for lacking an objective.
+# Example rank-mode scorer: hard correctness command + one higher-is-better metric.
+# Contract: <candidate-dir> -> one JSON object; nonzero exit is infrastructure failure.
 set -o pipefail
 cd "$1" || exit 3
 
-CORRECT_CMD="${AVO_CORRECT_CMD:-make test}"     # exit 0 => correct
-METRIC_CMD="${AVO_METRIC_CMD:-}"                 # must print exactly one number (higher = better)
-[ -n "$METRIC_CMD" ] || { echo "score-ci: set AVO_METRIC_CMD (rank mode needs a numeric objective)" >&2; exit 3; }
+CORRECT_CMD="${AVO_CORRECT_CMD:-make test}"
+METRIC_CMD="${AVO_METRIC_CMD:-}"
+[ -n "$METRIC_CMD" ] || { echo "score-ci: set AVO_METRIC_CMD" >&2; exit 3; }
+
+correct_log=$(mktemp "${TMPDIR:-/tmp}/avo-correct.XXXXXX") || exit 3
+metric_log=$(mktemp "${TMPDIR:-/tmp}/avo-metric.XXXXXX") || { rm -f "$correct_log"; exit 3; }
+trap 'rm -f "$correct_log" "$metric_log"' EXIT
 
 correct=false
-if sh -c "$CORRECT_CMD" >/tmp/avo-correct.$$ 2>&1; then correct=true; fi
+if sh -c "$CORRECT_CMD" >"$correct_log" 2>&1; then correct=true; fi
 
-objective=null; note=""
-if [ "$correct" = "true" ]; then
-  objective=$(sh -c "$METRIC_CMD" 2>/tmp/avo-metric.$$ | grep -Eo '[-+]?[0-9]*\.?[0-9]+' | head -1)
-  if [ -z "$objective" ]; then
-    rm -f /tmp/avo-correct.$$ /tmp/avo-metric.$$
-    echo "score-ci: metric command produced no number" >&2; exit 3   # infra error, not a correctness fail
-  fi
+objective=null
+if [ "$correct" = true ]; then
+  objective=$(sh -c "$METRIC_CMD" 2>"$metric_log" | grep -Eo '[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?' | head -1)
+  [ -n "$objective" ] || { echo "score-ci: metric command produced no number" >&2; exit 3; }
   note="tests pass; metric=$objective"
 else
-  note=$(tail -3 /tmp/avo-correct.$$ | tr '\n' ' ' | cut -c1-160)
+  note=$(tail -3 "$correct_log" | tr '\n' ' ' | cut -c1-160)
 fi
-rm -f /tmp/avo-correct.$$ /tmp/avo-metric.$$
 
-jq -n --argjson c "$correct" --argjson o "${objective:-null}" --arg n "$note" \
-  '{correct:$c, objective:$o, metrics:{}, note:$n}'
+python3 - "$correct" "$objective" "$note" <<'PY'
+import json, sys
+correct = sys.argv[1] == "true"
+objective = None if sys.argv[2] == "null" else float(sys.argv[2])
+print(json.dumps({"correct": correct, "objective": objective, "metrics": {}, "note": sys.argv[3]}))
+PY

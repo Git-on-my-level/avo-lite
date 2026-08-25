@@ -1,6 +1,12 @@
-# avo-lite creates these per task; never commit example runs
+# Local AVO runs while developing this repository
 .avo/
 ledger.jsonl
-# example/test task dirs
+avo.toml
+
+# Python test/cache output
+__pycache__/
+*.py[cod]
+
+# Example/test task directories
 /example/
 /scratch/

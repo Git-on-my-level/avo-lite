@@ -1,70 +1,116 @@
-# Authoring a score command (`f`)
+# Authoring a scorer
 
-The scorer is the whole game. Everything else (lineage, ratchet, supervisor) is mechanical once `f` is
-right. `avo init` refuses without one.
+The scorer defines the problem. AVO's worktrees, ledger, ratchet, memory, and supervisor are mechanical
+once the evaluation contract is reliable.
 
-## The contract
+## Contract
 
-`$AVO_SCORE_CMD <candidate-dir>` prints **one** JSON object to stdout and:
-- exits **0** when the evaluation *completed* — whether the candidate passed or failed correctness;
-- exits **non-zero** only on **infra failure** (compiler missing, network down). A non-zero exit is
-  recorded as a tick `error`, never a correctness fail, and does not increment the stall counter — so
-  transient flakes never poison the lineage.
+```text
+score-command <candidate-dir>
+```
+
+Print exactly one JSON object. Exit 0 when evaluation completed, whether correctness passed or failed.
+Exit nonzero only when evaluation itself could not run.
 
 ```json
 {
-  "correct":   true,
+  "correct": true,
   "objective": 0.873,
-  "metrics":   {"latency_ms": 12.3, "stddev": 0.4},
-  "note":      "branchless rescale; removed blocking fence",
+  "metrics": {"latency_ms": 12.3, "stddev": 0.4},
+  "note": "branchless rescale removed a blocking fence",
   "artifacts": ["profile.txt"]
 }
 ```
 
-Validated against `scripts/lib/score-schema.json`. Only `correct` is strictly required; `objective` is
-required (a number) in `rank` mode.
+## Rules
 
-## Design rules
+### Separate the gate from the metric
 
-1. **Separate the gate from the metric.** Compute `correct` first, from a real oracle (a reference
-   implementation, a test suite, an invariant check). Never fold correctness into the quality number.
-   If `correct` is false, `objective` is ignored — don't waste an expensive benchmark on a broken candidate.
+Compute `correct` from tests, a reference implementation, invariants, or another real oracle. If it is
+false, return immediately when possible:
 
-2. **Pick one scalar `objective`, higher-is-better.** If your natural metric is lower-is-better
-   (latency, cost), negate it (`objective = -latency_ms`). The vector goes in `metrics` for context and
-   dashboards; the ratchet only ever compares the one scalar. Do not try to encode a Pareto front here —
-   that is deliberately out of scope.
+```json
+{"correct":false,"objective":null,"metrics":{},"note":"property test failed"}
+```
 
-3. **Average and report `stddev` when the metric is noisy.** The ratchet's accept margin is
-   `max(min_improvement_abs, 1·stddev)`, so a scorer that reports `stddev` automatically refuses to
-   accept "wins" inside measurement noise. The AVO paper averages 10 runs for exactly this reason.
-   If you can't average, set a conservative `min_improvement_abs` in `avo.toml`.
+Rank mode requires a numeric objective only for correct candidates.
 
-4. **Make `note` a one-liner the next agent will act on.** It is fed forward as lineage context. "value=96"
-   is useless; "removed blocking fence on unmasked path, +8% non-causal" teaches the next iteration.
+### Use one higher-is-better scalar
 
-5. **Keep `f` fast, deterministic-ish, non-destructive, and fully automated.** It runs hundreds of times
-   unattended. If a single eval is minutes-to-hours or costs real money (cloud quota), widen the driver
-   cadence rather than making `f` cut corners.
+Negate lower-is-better quantities:
 
-## rank vs discover
+```text
+objective = -latency_ms
+objective = -cost_usd
+```
 
-- **rank** (optimization): `objective` is your real metric. The ratchet keeps only above-noise gains.
-  Example: `adapters/score-ci.sh` — correctness = a test suite passes, objective = a benchmark number.
-- **discover** (sparse reward, security-research-shaped): `objective` is a **monotone coverage counter**
-  (hypotheses tested, findings recorded), not a quality score; every correct candidate is appended.
-  Correctness here means "a real, non-hallucinated finding". **Pair with `--verify`** so an adversarial
-  falsification pass drops bogus findings before they enter the lineage. Example: `adapters/score-discover.sh`.
+Keep diagnostic dimensions in `metrics`; the ratchet compares only `objective`.
+
+### Quantify measurement noise
+
+Average repeated runs when practical and report `metrics.stddev`. AVO requires:
+
+```text
+candidate > best + max(min_improvement_abs, stddev)
+```
+
+This avoids accepting wins inside ordinary run-to-run variation.
+
+### Make the note useful to the next model
+
+Prefer:
+
+```text
+batched metadata writes; +7% on large cases, unchanged small cases
+```
+
+not:
+
+```text
+objective=0.873
+```
+
+### Preserve evidence
+
+List relative artifact paths under the candidate directory. AVO copies regular files into the run
+directory before removing the worktree.
+
+## Rank mode
+
+Use a stable metric with meaningful ordering. The first correct candidate seeds an incorrect or
+unscored baseline. A no-op or regression is rejected without changing canonical Git state.
+
+## Discover mode
+
+Use `correct=true` for a validated resolved item. That may be:
+
+- a confirmed positive finding;
+- a decisively disproved hypothesis;
+- a completed test class with an honest negative result.
+
+When helpful, use `objective` as monotone validated coverage. Do not count only positive findings or
+the loop will learn to avoid useful falsification. Pair soft discovery scorers with an adversarial
+verifier.
+
+## Verifier contract
+
+```text
+verify-command <candidate-dir> <score-json-path>
+```
+
+```json
+{"pass":false,"note":"competing control reproduces the effect","evidence":["control.json"]}
+```
+
+Exit 0 means a verdict was reached. Nonzero means infrastructure failure.
 
 ## Common scorer shapes
 
-- **Test-suite wrapper** (`score-ci.sh`): `correct = (make test exits 0)`, `objective = extract a
-  number from a bench command`. Point `AVO_CORRECT_CMD` / `AVO_METRIC_CMD` at your repo's commands.
-- **Reference-oracle numeric**: run candidate and a reference on the same inputs; `correct = outputs
-  match within tolerance`; `objective = throughput/accuracy`.
-- **Coverage counter** (`score-discover.sh`): `correct = latest finding parses and isn't marked
-  hallucinated`; `objective = count of recorded findings`.
-- **LLM-judge** (last resort, when no mechanical metric exists): a cheap model scores the candidate
-  against a rubric. Prefer a mechanical `f`; a judge is softer and slower, but still valid if it is
-  automated and reasonably stable. Keep the *correctness* half mechanical even when the *quality* half
-  is judged.
+- test suite + benchmark;
+- candidate output compared with a reference oracle;
+- accuracy/eval score with hard format and safety checks;
+- monotone resolved-hypothesis coverage;
+- rubric judge only when no mechanical objective exists.
+
+Keep the evaluator automated, reasonably fast, non-destructive, and deterministic enough for many
+unattended invocations.

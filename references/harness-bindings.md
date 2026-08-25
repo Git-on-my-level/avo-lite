@@ -1,78 +1,77 @@
 # Harness bindings
 
-The core unit is `avo tick` — one idempotent iteration, safe under any scheduler. The model lives
-*inside* `$AVO_AGENT_CMD`, so every harness treats a tick as a plain command. Only the invocation and
-the scheduler differ; the scaffold, ledger, ratchet, and supervisor are identical everywhere.
+`avo tick` is one synchronous, locked, self-contained candidate attempt. Any scheduler that can run a
+command can drive it. The model invocation belongs inside the configured adapter.
 
-Assume `AVO=/path/to/avo-lite/scripts` and a task already `init`ed in `<task-dir>`.
+Assume `AVO=/path/to/avo-lite/scripts` and a task is already initialized.
 
-## Hermes cron
+## Cron
 
-Two `no_agent` jobs (the model is inside the agent adapter, so Hermes itself schedules only):
-
-```json
-{
-  "id": "mytask-driver",
-  "schedule": "0 */2 * * *",
-  "no_agent": true,
-  "command": "cd /path/to/<task-dir> && /path/to/avo tick",
-  "deliver_to": "telegram:<your DM>"
-}
-{
-  "id": "mytask-stall-watch",
-  "schedule": "17 * * * *",
-  "no_agent": true,
-  "command": "cd /path/to/<task-dir> && /path/to/avo-stall-detect || true"
-}
+```cron
+*/30 * * * * cd /path/to/project && /path/to/avo tick >> .avo/cron.log 2>&1
 ```
 
-This mirrors a common production pattern: a periodic agent driver plus a more frequent no-LLM watchdog. Set model tiers in `avo.toml`
-(`driver`/`supervisor`) — the adapter reads `AVO_DRIVER_MODEL`/`AVO_SUPERVISOR_MODEL`. Job installation is scheduler-specific; wire `avo tick` into whatever cron/agent runner you use.
+A task marked `stalled` rejects future ticks until `avo resume`, preventing an unattended scheduler
+from spending indefinitely after the configured redirects fail.
 
 ## Claude Code
 
 ```bash
-# self-paced loop
-/loop 30m avo tick
+avo init task \
+  --goal "..." \
+  --score ./score.sh \
+  --agent "$AVO/adapters/agent-claude.sh"
 ```
 
-or configure the task with the Claude adapter and run ticks by hand / from cron:
+Or let `avo init` use that packaged adapter by default.
+
+## Agent launcher
 
 ```bash
-$AVO/avo init t --goal "…" --score …/score.sh --agent "$AVO/adapters/agent-claude.sh"
+export AVO_AGENTCTL_TARGET="codex exec"
+avo init task \
+  --goal "..." \
+  --score ./score.sh \
+  --agent "$AVO/adapters/agent-agentctl.sh"
 ```
 
-`agent-claude.sh` runs `claude -p` headless with `--permission-mode acceptEdits` and a tool allowlist,
-passing `--model $AVO_DRIVER_MODEL` when set.
+The example adapter expects an `agentctl run/await/result` interface. Adapt its three calls for another
+launcher while preserving:
 
-## Bare cron / shell
+```text
+adapter <candidate-dir> <prompt-file>
+```
+
+## Model tiers
+
+Set models in `.avo/config.json` or environment variables:
+
+```bash
+export AVO_DRIVER_MODEL="cheap-driver"
+export AVO_SUPERVISOR_MODEL="strong-supervisor"
+```
+
+The driver runs every tick. The supervisor runs only after deterministic stagnation or a manual
+`avo supervise` / `avo reflect` request.
+
+## External state directory
+
+Repo-local state is simplest. For environments that routinely delete ignored directories or use
+aggressive `git clean -ffdx`, set the exact task state directory consistently:
 
 ```cron
-*/30 * * * * cd /path/to/<task-dir> && /path/to/avo tick >> tick.log 2>&1
+AVO_HOME=/var/lib/avo/my-task cd /path/to/project && /path/to/avo tick
 ```
 
-or a foreground loop with sleep:
+The candidate worktrees are then created under that external directory.
 
-```bash
-$AVO/avo run --sleep 1800 --until-stagnant
-```
+## Cadence
 
-## Any agent-launcher CLI (codex / omp / cursor / …)
+Choose cadence from the combined cost of agent and evaluator:
 
-Route the agent through an agent-launcher CLI (this example uses `agentctl`):
+- local tests and short benchmarks: minutes;
+- long benchmarks or cloud quota: tens of minutes to hours;
+- human or expensive verification: trigger less frequently or verify only release-worthy gains.
 
-```bash
-export AVO_AGENTCTL_TARGET="omp"          # or: "codex exec"
-$AVO/avo init t --goal "…" --score …/score.sh --agent "$AVO/adapters/agent-agentctl.sh"
-```
-
-`agent-agentctl.sh` does `agentctl run -- <target> …`, `agentctl await`, `agentctl result`. The
-supervisor call goes through the same adapter with `AVO_SUPERVISOR_MODEL`. Consult your launcher's
-own model/trust settings for unattended runs.
-
-## Choosing the driver cadence
-
-- Cheap, fast `f` (unit tests, a local benchmark): tight cadence (a `/loop` or a 5–15 min cron).
-- Expensive `f` (real cloud quota, long benchmark, human-in-loop verify): 1–6 h cadence (e.g. a 2-hourly driver). Budget the eval, not just the agent.
-- Always add `avo-stall-detect` as a cheaper, more frequent watchdog than the driver so a stall is
-  caught between driver ticks.
+The core intentionally does not detach workers or manage a job queue. Use the scheduler or agent
+launcher for process-level distribution; keep each `avo tick` synchronous and observable.

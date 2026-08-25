@@ -1,60 +1,61 @@
-# The seven AVO-lite invariants (why each is load-bearing)
+# AVO-lite invariants
 
-The smallest set that makes an agent loop *evolutionary* rather than *a cron that calls an LLM*.
-If you build nothing else, build 2, 3, and 6 — those are the ones most hand-built loops skip.
+AVO-lite remains useful because it enforces a small set of transitions rather than becoming a full
+agent framework.
 
-1. **Split gate.**
-   Correctness is a **hard boolean, evaluated first and separately**; a failing candidate is rejected
-   outright and its quality metric is never inspected. Quality is a *vector* plus one scalar `objective`.
-   *Why:* it stops the agent from trading correctness for score — the failure mode every naive fitness
-   loop hits. In the AVO paper a kernel that fails numerical correctness scores 0 regardless of TFLOPS.
+## 1. Correctness and objective are separate
 
-2. **Scored, immutable lineage that is read back as context.**
-   Persisted *and retrieved* — the prior scored versions and their notes are fed into the next agent run.
-   *Why:* this is the move that turns a cron into evolution. Persisting history you never read back
-   (a git log nobody feeds forward) buys you nothing; the agent starts cold every time.
+The scorer returns a Boolean gate and a higher-is-better scalar. When correctness fails, the
+objective is ignored and may be null. This prevents a fast or aesthetically pleasing wrong candidate
+from entering the lineage and avoids wasting expensive benchmark work on known-broken candidates.
 
-3. **Commit ratchet.**
-   A candidate enters the lineage only if it passes correctness and is not worse than the best so far.
-   The agent's failed internal attempts never pollute the lineage.
-   *Why:* keeps the search monotone without needing a population/archive. In `discover` mode the ratchet
-   relaxes to append-only (every correct find is kept) because reward is sparse and orthogonal.
+## 2. Candidate work is transactional
 
-4. **Agent owns its inner loop.**
-   Many internal attempts (edit → test → diagnose → revise) per *one* committed version. The scaffold
-   gates commits; it does not micromanage the agent's turns.
-   *Why:* this is exactly what separates AVO from framework-owned `Generate(Sample(P))` — the agent
-   decides what to consult, what to edit, and when to evaluate.
+Each tick creates a detached Git worktree under `.avo/runs/<tick>/worktree`. The agent, scorer, and
+verifier operate there. Rejection is deletion, not `git reset` in the user's working checkout.
 
-5. **Retrievable K (knowledge base).**
-   Domain docs and reference implementations the agent *may consult at will* — a directory plus
-   `K/INDEX.md`, opened with the agent's own tools. Not embeddings, not prompt-stuffing.
-   *Why:* cheap, portable, and it lets the agent pull the *relevant* reference at the *relevant* step.
+This is isolation for reliability, not a hostile-code sandbox.
 
-6. **Stagnation detector + trajectory-level redirect.**
-   A cheap, no-LLM detector watches the ledger for stall / unproductive cycles / repeat edits; on
-   trigger a rare, expensive agent reviews the *whole trajectory* and proposes several fresh directions.
-   Conditional intervention — it does not run the search.
-   *Why:* this is why NVIDIA's run went 7 days unattended. Circuit-breakers (`max_retries`) only make a
-   loop *give up*; this makes it *re-aim*.
+## 3. Accepted lineage is monotone
 
-7. **Cheap-frequent / expensive-rare model split.**
-   Driver ticks run on a cheap model; the supervisor runs on Opus/Fable.
-   *Why:* the driver fires hundreds of times, the supervisor a handful; spend accordingly.
+In rank mode, only above-noise improvement enters the canonical branch. In discover mode, every
+correct resolved item may enter because progress can be orthogonal rather than scalar.
 
-## What is GPU-incidental in the paper (safe to drop)
+## 4. Raw evidence is append-only
 
-CUDA/PTX/TFLOPS/B200, the profiler-as-feedback channel, the 7-day budget, and the single-lineage choice
-are all domain-specific. So is the *reward shape*: kernel optimization has a fast deterministic `f`, a
-real reference oracle, dense headroom, and cheap resets — an near-ideal AVO substrate. Most real tasks
-have a noisier or sparser `f`; that is why AVO-lite has two modes and an optional verify gate.
+The ledger and per-run artifacts retain accepts, rejects, errors, scores, verifier verdicts, and
+prompts. Curated memory may change; raw evidence does not. Reports may be redacted, but the source of
+truth must remain intact.
 
-## Field lessons the paper does not cover (don't regress these)
+## 5. Stored history is fed forward
 
-Drawn from production autonomous loops this scaffold was distilled from:
+The next driver sees recent accepted and rejected attempts, curated memory, human pins, and any
+supervisor redirect. A Git log that is never placed in model context is not evolutionary memory.
 
-- **Adversarial falsification before trust** (`--verify`) — stronger than a correctness gate for domains
-  with no reference oracle.
-- **Epistemic self-correction** — redacting the source of truth caused false findings; keep the ledger raw.
-- **Multi-provider tiering, silent-on-success, verdict-with-evidence-paths** — operational maturity the
-  paper doesn't cover. AVO-lite grafts the paper's *loop structure* onto these *epistemics*.
+## 6. The agent owns its inner loop
+
+AVO requests one coherent candidate, not one edit or one model turn. The agent may inspect, test,
+diagnose, and revise repeatedly before the scorer sees the result.
+
+## 7. Verification challenges would-be winners
+
+An adversarial verifier is optional and expensive, so it runs only after correctness and ratchet
+checks indicate acceptance. A falsified result is a normal reject; verifier execution failure is an
+infrastructure error.
+
+## 8. Stagnation is deterministic; redirection is rare
+
+Ledger statistics detect stalls. The supervisor reads the meaningful trajectory, including failures,
+and emits a one-shot redirect. Redirects and human resumes start fresh detection windows. Repeated
+failure eventually halts paid ticks for human review.
+
+## 9. Human pins outrank generated strategy
+
+Pins are durable Markdown written through explicit human commands. Driver and supervisor prompts
+receive them before ordinary memory and trajectory context.
+
+## 10. Domain features remain outside the kernel
+
+Planner agents, hypothesis registries, monitoring sentinels, resource dashboards, and research
+profiles should integrate through commands, prompts, and files. They are not prerequisites for a
+simple rank-mode loop.

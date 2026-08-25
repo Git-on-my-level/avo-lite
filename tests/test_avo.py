@@ -398,6 +398,39 @@ class AvoIntegrationTests(unittest.TestCase):
         prompt = (self.repo / ".avo" / "runs" / "000001" / "prompt.md").read_text()
         self.assertIn(".avo/knowledge/INDEX.md", prompt)
 
+    def test_generic_exec_adapter_runs_avo_exec(self):
+        adapter = PROJECT_ROOT / "scripts" / "adapters" / "agent-exec.sh"
+        inner = self.write_python_hook(
+            "inner.py",
+            """
+            from pathlib import Path
+            Path("value.txt").write_text("1\\n")
+            """,
+        )
+        score = self.write_python_hook(
+            "score.py",
+            """
+            import json, pathlib, sys
+            value = int(pathlib.Path(sys.argv[1], "value.txt").read_text())
+            print(json.dumps({"correct": True, "objective": value, "metrics": {}, "note": f"value={value}"}))
+            """,
+        )
+        self.write("value.txt", "0\n")
+        self.avo(
+            "init",
+            "demo",
+            "--goal",
+            "maximize",
+            "--agent",
+            str(adapter),
+            "--score",
+            str(score),
+            env={"AVO_EXEC": str(inner)},
+        )
+        self.avo("tick", env={"AVO_EXEC": str(inner)})
+        self.assertEqual((self.repo / "value.txt").read_text(), "1\n")
+        self.assertEqual(self.ledger()[-1]["action"], "accept")
+
 
 if __name__ == "__main__":
     unittest.main()

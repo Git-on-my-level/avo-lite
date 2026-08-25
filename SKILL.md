@@ -106,8 +106,8 @@ The agent receives a disposable candidate directory and a generated prompt. It s
 AVO captures the complete candidate tree relative to the starting commit, so an accidental local
 commit is normalized into the same final patch.
 
-`--agent` is a two-argument executable you supply. There is no default vendor CLI. See
-`scripts/adapters/` for copy-and-edit examples.
+`--agent` is required. Use `scripts/adapters/agent-exec.sh` with `AVO_EXEC` set to your CLI, or pass
+any two-argument executable. There is no default vendor CLI.
 
 ## Adversarial verification
 

@@ -4,10 +4,10 @@
 command can drive it. The model invocation belongs inside **your** adapter. AVO does not default to a
 vendor CLI.
 
-Assume `AVO=/path/to/avo-lite/scripts` and a task is already initialized. Shipped examples live in
-`scripts/adapters/` (`$AVO/adapters/`), not `references/adapters/`.
+Assume `AVO=/path/to/avo-lite/scripts`. The one supported adapter is
+`$AVO/adapters/agent-exec.sh`. It is not `references/adapters/`.
 
-## Write an adapter
+## Agent adapter
 
 Contract:
 
@@ -15,39 +15,28 @@ Contract:
 adapter <candidate-dir> <prompt-file>
 ```
 
-Rules:
-
-1. Edit only the candidate directory. AVO scores that tree, then either commits one patch or deletes it.
-2. Exit 0 when the tree is ready. Nonzero is an infrastructure error unless `score_on_agent_error` is set.
-3. Do not push, and do not write AVO state (`.avo/config.json`, ledger, pins).
-4. Read `.avo/knowledge/` inside the candidate when the prompt points at it.
-5. Honor `AVO_DRIVER_MODEL` / `AVO_SUPERVISOR_MODEL` if your CLI has a model flag.
-
-Minimal template:
+Use the packaged adapter and put your CLI in `AVO_EXEC`:
 
 ```bash
-#!/bin/sh
-set -eu
-cd "$1"
-# Replace this line with any authenticated CLI you already have.
-exec your-agent --prompt-file "$2"
+export AVO_EXEC='your-agent --prompt-file "$AVO_PROMPT"'
+avo init task --goal "..." --score ./score.sh --agent "$AVO/adapters/agent-exec.sh"
 ```
 
-`--agent` is required at `avo init`. Point it at this script (or an inline command).
+The candidate is cwd. `AVO_PROMPT` is the prompt file. `AVO_CANDIDATE` is the candidate path.
+Honor `AVO_DRIVER_MODEL` / `AVO_SUPERVISOR_MODEL` if your CLI has a model flag.
 
-Example wrappers in this repo, for copy-and-edit only:
+Write your own script only when `AVO_EXEC` is too awkward (multi-step launchers). Keep the same
+two-argument contract. Do not push or write AVO state. Read `.avo/knowledge/` in the candidate when
+the prompt points at it.
+
+Vendor CLIs are `AVO_EXEC` values, not repo files:
 
 ```bash
-# Claude Code
---agent "$AVO/adapters/agent-claude.sh"
-
-# agentctl run/await/result
-export AVO_AGENTCTL_TARGET="codex exec"
---agent "$AVO/adapters/agent-agentctl.sh"
+export AVO_EXEC='claude -p "$(cat "$AVO_PROMPT")" --permission-mode acceptEdits'
+export AVO_EXEC='hermes -z < "$AVO_PROMPT"'
 ```
 
-Adapt the three `agentctl` calls, or replace the body entirely, as long as the two-argument contract
-stays the same.
+A multi-step launcher example lives at `$AVO/adapters/agent-agentctl.sh`.
 
 ## Cron
 

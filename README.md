@@ -64,26 +64,27 @@ is accepted. If `--score` is given and the baseline score is invalid, init fails
 
 ## Agent adapter
 
-AVO does not ship a default model CLI. Write a small executable that implements:
+AVO does not ship a vendor CLI. `--agent` must be a command that implements:
 
 ```text
 adapter <candidate-dir> <prompt-file>
 ```
 
-It must `cd` into the candidate (or otherwise edit that tree in place), run whatever agent you have,
-and exit 0 when the tree is ready to score. AVO sets `AVO_TICK`, `AVO_DRIVER_MODEL`, and
-`AVO_SUPERVISOR_MODEL`.
+The packaged adapter is [`scripts/adapters/agent-exec.sh`](scripts/adapters/agent-exec.sh). It `cd`s
+into the candidate and runs `AVO_EXEC`. Put any authenticated CLI you already have in that variable.
 
 ```bash
-#!/bin/sh
-# ./agent.sh — replace the inner command with yours
-set -eu
-cd "$1"
-your-agent --prompt-file "$2"
+export AVO=/path/to/avo-lite/scripts
+export AVO_EXEC='your-agent --prompt-file "$AVO_PROMPT"'
+avo init speedup --goal "..." --score ./score.sh --agent "$AVO/adapters/agent-exec.sh"
 ```
 
-Example wrappers live in [`scripts/adapters/`](scripts/adapters/). They are references, not defaults.
-See [`references/harness-bindings.md`](references/harness-bindings.md).
+`AVO_CANDIDATE` and `AVO_PROMPT` are set. AVO also exports `AVO_TICK`, `AVO_DRIVER_MODEL`, and
+`AVO_SUPERVISOR_MODEL`.
+
+Vendor CLIs belong in your `AVO_EXEC` line, not in this repo. A launcher-style example is
+[`scripts/adapters/agent-agentctl.sh`](scripts/adapters/agent-agentctl.sh). See
+[`references/harness-bindings.md`](references/harness-bindings.md).
 
 ## Where runs live
 

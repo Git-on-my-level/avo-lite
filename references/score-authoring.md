@@ -90,7 +90,8 @@ Use `correct=true` for a validated resolved item. That may be:
 
 When helpful, use `objective` as monotone validated coverage. Do not count only positive findings or
 the loop will learn to avoid useful falsification. Pair soft discovery scorers with an adversarial
-verifier.
+verifier. If shrinkage is a contract violation, set `correct=false`; AVO will not reject a smaller
+objective in discover mode.
 
 ## Verifier contract
 

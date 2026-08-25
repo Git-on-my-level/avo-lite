@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Agent adapter: Claude Code headless. Contract: <candidate-dir> <prompt-file>.
-# The agent edits the working tree in place; stdout is captured as transcript.
+# Example adapter only — not the AVO default. Contract: <candidate-dir> <prompt-file>.
+# Copy and edit, or write your own. The agent edits the working tree in place.
 # Model tier comes from AVO_DRIVER_MODEL / AVO_SUPERVISOR_MODEL (driver sets one).
 set -e
 cd "$1"

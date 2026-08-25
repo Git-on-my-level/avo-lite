@@ -61,7 +61,13 @@ avo init <task> \
 ```
 
 AVO creates `avo/<task>`, commits baseline v0, evaluates it, and stores local state in `.avo/` using
-`.git/info/exclude`. `AVO_HOME=/another/path` relocates that task state when set consistently.
+`.git/info/exclude`. `--agent` is required. `AVO_HOME=/another/path` relocates that task state when
+set consistently.
+
+`--k` copies host-side reference material into `.avo/knowledge/`. Each candidate worktree receives a
+copy at `.avo/knowledge/`; it is not committed.
+
+If `--score` is given, a malformed baseline score fails init (`.avo/` is removed).
 
 ## Write the scorer first
 
@@ -99,6 +105,9 @@ The agent receives a disposable candidate directory and a generated prompt. It s
 
 AVO captures the complete candidate tree relative to the starting commit, so an accidental local
 commit is normalized into the same final patch.
+
+`--agent` is a two-argument executable you supply. There is no default vendor CLI. See
+`scripts/adapters/` for copy-and-edit examples.
 
 ## Adversarial verification
 
@@ -208,7 +217,9 @@ The first correct candidate seeds an unscored or incorrect baseline.
 
 Use for sparse, orthogonal progress. Every correct candidate is appended. Define correctness as a
 validated resolved item, not necessarily a positive finding; honest negative results can therefore
-advance coverage. Use an objective only when a monotone coverage count is meaningful.
+advance coverage. Use an objective only when a monotone coverage count is meaningful. If a smaller
+corpus or coverage count is invalid, set `correct=false` in the scorer — discover mode will not
+reject on a shrinking objective.
 
 ## Optional extensions
 

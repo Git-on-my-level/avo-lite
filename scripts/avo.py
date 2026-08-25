@@ -14,7 +14,6 @@ import math
 import os
 import re
 import shutil
-import shlex
 import signal
 import socket
 import subprocess
@@ -27,8 +26,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 VERSION = 2
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_AGENT = shlex.quote(str(SCRIPT_DIR / "adapters" / "agent-claude.sh"))
 TERMINAL_ACTIONS = {"accept", "reject", "error", "preview"}
 
 
@@ -37,10 +34,11 @@ class AvoError(RuntimeError):
 
 
 class HookResult:
-    def __init__(self, returncode: int, stdout: Path, stderr: Path):
+    def __init__(self, returncode: int, stdout: Path, stderr: Path, timed_out: bool = False):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+        self.timed_out = timed_out
 
 
 def quiet() -> bool:
@@ -519,6 +517,7 @@ def run_hook(
     stdout_path: Path,
     stderr_path: Path,
     env_updates: Optional[Dict[str, str]] = None,
+    timeout: Optional[float] = None,
 ) -> HookResult:
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -527,10 +526,37 @@ def run_hook(
     argv = ["/bin/sh", "-c", command + ' "$@"', "avo-hook"] + [str(arg) for arg in args]
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
         try:
-            result = subprocess.run(argv, cwd=str(cwd), env=env, stdout=stdout, stderr=stderr, check=False)
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(cwd),
+                env=env,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
+            )
         except FileNotFoundError:
             raise AvoError("missing /bin/sh; hook commands require a POSIX shell")
-    return HookResult(result.returncode, stdout_path, stderr_path)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            return HookResult(124, stdout_path, stderr_path, timed_out=True)
+    return HookResult(proc.returncode, stdout_path, stderr_path)
+
+
+def hook_timeout_seconds(task: Task) -> Optional[float]:
+    raw = os.environ.get("AVO_HOOK_TIMEOUT")
+    if raw is None or raw == "":
+        raw = task.setting("search", "hook_timeout_sec", 0)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise AvoError("hook timeout must be a number of seconds")
+    if value <= 0:
+        return None
+    return value
 
 
 def validate_score(score: Dict[str, Any], mode: str) -> None:
@@ -615,6 +641,16 @@ def create_worktree(task: Task, path: Path, base_commit: str) -> None:
     result = git(task.root, ["worktree", "add", "--detach", "--force", str(path), base_commit], check=False)
     if result.returncode != 0:
         raise AvoError("could not create candidate worktree:\n{}".format((result.stderr or result.stdout).strip()))
+    materialize_knowledge(task, path)
+
+
+def materialize_knowledge(task: Task, worktree: Path) -> None:
+    if not task.knowledge_dir.exists():
+        return
+    destination = worktree / ".avo" / "knowledge"
+    if destination.exists():
+        shutil.rmtree(str(destination))
+    shutil.copytree(str(task.knowledge_dir), str(destination))
 
 
 def remove_worktree(task: Task, path: Path) -> None:
@@ -713,9 +749,9 @@ def build_driver_prompt(task: Task, state: Dict[str, Any], run_dir: Path, redire
     memory = read_optional(task.memory_path)
     if memory:
         sections.append("## Curated memory\n{}".format(memory))
-    index_path, index = knowledge_index(task)
+    _index_path, index = knowledge_index(task)
     if index:
-        sections.append("## Knowledge index\nPath: `{}`\n\n{}".format(index_path, index))
+        sections.append("## Knowledge index\nPath: `.avo/knowledge/INDEX.md`\n\n{}".format(index))
 
     current = state.get("best_commit") or head_commit(task.root)
     if current:
@@ -970,7 +1006,11 @@ def score_candidate(task: Task, candidate: Path, run_dir: Path) -> Tuple[Optiona
     command = task.command("score")
     if not command:
         return None, "no score command configured"
-    result = run_hook(command, [candidate], candidate, run_dir / "score.json", run_dir / "score.err")
+    result = run_hook(
+        command, [candidate], candidate, run_dir / "score.json", run_dir / "score.err", timeout=hook_timeout_seconds(task)
+    )
+    if result.timed_out:
+        return None, "score command timeout"
     if result.returncode != 0:
         return None, "score command infra failure (exit {})".format(result.returncode)
     try:
@@ -992,7 +1032,10 @@ def verify_candidate(task: Task, candidate: Path, run_dir: Path) -> Tuple[Option
         candidate,
         run_dir / "verify.json",
         run_dir / "verify.err",
+        timeout=hook_timeout_seconds(task),
     )
+    if result.timed_out:
+        return None, "verify command timeout"
     if result.returncode != 0:
         return None, "verify command infra failure (exit {})".format(result.returncode)
     try:
@@ -1067,7 +1110,16 @@ def supervisor_internal(task: Task, state: Dict[str, Any], reason: str, automati
             run_dir / "supervisor.stdout",
             run_dir / "supervisor.stderr",
             {"AVO_SUPERVISOR_MODEL": model},
+            timeout=hook_timeout_seconds(task),
         )
+        if result.timed_out:
+            note = "supervisor timeout"
+            append_ledger(task, {"tick": state.get("tick", 0), "action": "supervisor_error", "note": note, "run_dir": run_relative(task, run_dir)})
+            state["status"] = "stalled" if automatic else state.get("status", "running")
+            state["last_action"] = "supervisor_error"
+            task.write_state(state)
+            warn(note)
+            return False
         if result.returncode != 0:
             note = "supervisor failed with exit {}".format(result.returncode)
             append_ledger(task, {"tick": state.get("tick", 0), "action": "supervisor_error", "note": note, "run_dir": run_relative(task, run_dir)})
@@ -1149,6 +1201,7 @@ def new_config(task_name: str, goal: str, mode: str, agent: str, score: str, ver
             "repeat_edit_max": 3,
             "max_redirects": 2,
             "score_on_agent_error": False,
+            "hook_timeout_sec": 0,
         },
         "report": {"notify_min_objective": None},
     }
@@ -1174,6 +1227,8 @@ def init_prompts(task: Task) -> None:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    if not args.agent:
+        raise AvoError("missing --agent; pass an executable command that implements: <candidate-dir> <prompt-file>")
     root = git_root(Path.cwd())
     if root is None:
         run_process(["git", "init", "-q", str(Path.cwd())], capture=True)
@@ -1216,7 +1271,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         args.task,
         args.goal,
         args.mode,
-        args.agent or DEFAULT_AGENT,
+        args.agent,
         args.score or "",
         args.verify or "",
         args.supervisor or "",
@@ -1267,32 +1322,31 @@ def cmd_init(args: argparse.Namespace) -> int:
         info("scoring baseline v0")
         score, error = score_candidate(task, root, baseline_dir)
         if error:
-            warn("baseline was not seeded: {}".format(error))
-            append_ledger(task, {"tick": 0, "action": "baseline_error", "note": error, "commit": base, "diff_hash": "baseline"})
-        else:
-            assert score is not None
-            correct = bool(score["correct"])
-            objective = score.get("objective") if correct else None
-            if correct:
-                state["best_commit"] = base
-                state["best_objective"] = objective
-            task.write_state(state)
-            append_ledger(
-                task,
-                {
-                    "tick": 0,
-                    "action": "baseline",
-                    "correct": correct,
-                    "objective": objective,
-                    "delta": 0,
-                    "note": score.get("note", "baseline"),
-                    "commit": base,
-                    "parent": git_text(root, ["rev-parse", "{}^".format(base)]) if git(root, ["rev-parse", "{}^".format(base)], check=False).returncode == 0 else None,
-                    "diff_hash": "baseline",
-                    "metrics": score.get("metrics", {}),
-                    "run_dir": run_relative(task, baseline_dir),
-                },
-            )
+            shutil.rmtree(str(task.avo_dir), ignore_errors=True)
+            raise AvoError("baseline was not seeded: {}".format(error))
+        assert score is not None
+        correct = bool(score["correct"])
+        objective = score.get("objective") if correct else None
+        if correct:
+            state["best_commit"] = base
+            state["best_objective"] = objective
+        task.write_state(state)
+        append_ledger(
+            task,
+            {
+                "tick": 0,
+                "action": "baseline",
+                "correct": correct,
+                "objective": objective,
+                "delta": 0,
+                "note": score.get("note", "baseline"),
+                "commit": base,
+                "parent": git_text(root, ["rev-parse", "{}^".format(base)]) if git(root, ["rev-parse", "{}^".format(base)], check=False).returncode == 0 else None,
+                "diff_hash": "baseline",
+                "metrics": score.get("metrics", {}),
+                "run_dir": run_relative(task, baseline_dir),
+            },
+        )
     else:
         append_ledger(task, {"tick": 0, "action": "baseline", "correct": None, "objective": None, "note": "preview baseline", "commit": base, "diff_hash": "baseline"})
         warn("no --score given: preview mode; ticks save diffs but accept nothing")
@@ -1345,6 +1399,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 run_dir / "agent.stdout",
                 run_dir / "agent.stderr",
                 {"AVO_TICK": str(tick), "AVO_DRIVER_MODEL": task.model("driver")},
+                timeout=hook_timeout_seconds(task),
             )
             active["agent_rc"] = result.returncode
             active["phase"] = "capturing"
@@ -1368,6 +1423,19 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 return 0
 
             score_on_error = bool(task.setting("search", "score_on_agent_error", False))
+            if result.timed_out:
+                entry = {
+                    "tick": tick,
+                    "action": "error",
+                    "note": "agent timeout",
+                    "parent": base,
+                    "diff_hash": diff_hash,
+                    "agent_model": task.model("driver"),
+                    "run_dir": run_relative(task, run_dir),
+                }
+                finish_run(task, state, entry, worktree)
+                report_event(task, "tick {} error: agent timeout".format(tick))
+                return 0
             if result.returncode != 0 and not (score_on_error and has_diff):
                 entry = {
                     "tick": tick,
@@ -1552,7 +1620,10 @@ def cmd_reflect(args: argparse.Namespace) -> int:
                 run_dir / "reflect.stdout",
                 run_dir / "reflect.stderr",
                 {"AVO_SUPERVISOR_MODEL": task.model("supervisor")},
+                timeout=hook_timeout_seconds(task),
             )
+            if result.timed_out:
+                raise AvoError("reflect command timeout")
             if result.returncode != 0:
                 raise AvoError("reflect command failed with exit {}".format(result.returncode))
             memory = (run_dir / "reflect.stdout").read_text(encoding="utf-8").strip()

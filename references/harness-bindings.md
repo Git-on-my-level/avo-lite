@@ -1,9 +1,53 @@
 # Harness bindings
 
 `avo tick` is one synchronous, locked, self-contained candidate attempt. Any scheduler that can run a
-command can drive it. The model invocation belongs inside the configured adapter.
+command can drive it. The model invocation belongs inside **your** adapter. AVO does not default to a
+vendor CLI.
 
-Assume `AVO=/path/to/avo-lite/scripts` and a task is already initialized.
+Assume `AVO=/path/to/avo-lite/scripts` and a task is already initialized. Shipped examples live in
+`scripts/adapters/` (`$AVO/adapters/`), not `references/adapters/`.
+
+## Write an adapter
+
+Contract:
+
+```text
+adapter <candidate-dir> <prompt-file>
+```
+
+Rules:
+
+1. Edit only the candidate directory. AVO scores that tree, then either commits one patch or deletes it.
+2. Exit 0 when the tree is ready. Nonzero is an infrastructure error unless `score_on_agent_error` is set.
+3. Do not push, and do not write AVO state (`.avo/config.json`, ledger, pins).
+4. Read `.avo/knowledge/` inside the candidate when the prompt points at it.
+5. Honor `AVO_DRIVER_MODEL` / `AVO_SUPERVISOR_MODEL` if your CLI has a model flag.
+
+Minimal template:
+
+```bash
+#!/bin/sh
+set -eu
+cd "$1"
+# Replace this line with any authenticated CLI you already have.
+exec your-agent --prompt-file "$2"
+```
+
+`--agent` is required at `avo init`. Point it at this script (or an inline command).
+
+Example wrappers in this repo, for copy-and-edit only:
+
+```bash
+# Claude Code
+--agent "$AVO/adapters/agent-claude.sh"
+
+# agentctl run/await/result
+export AVO_AGENTCTL_TARGET="codex exec"
+--agent "$AVO/adapters/agent-agentctl.sh"
+```
+
+Adapt the three `agentctl` calls, or replace the body entirely, as long as the two-argument contract
+stays the same.
 
 ## Cron
 
@@ -14,33 +58,8 @@ Assume `AVO=/path/to/avo-lite/scripts` and a task is already initialized.
 A task marked `stalled` rejects future ticks until `avo resume`, preventing an unattended scheduler
 from spending indefinitely after the configured redirects fail.
 
-## Claude Code
-
-```bash
-avo init task \
-  --goal "..." \
-  --score ./score.sh \
-  --agent "$AVO/adapters/agent-claude.sh"
-```
-
-Or let `avo init` use that packaged adapter by default.
-
-## Agent launcher
-
-```bash
-export AVO_AGENTCTL_TARGET="codex exec"
-avo init task \
-  --goal "..." \
-  --score ./score.sh \
-  --agent "$AVO/adapters/agent-agentctl.sh"
-```
-
-The example adapter expects an `agentctl run/await/result` interface. Adapt its three calls for another
-launcher while preserving:
-
-```text
-adapter <candidate-dir> <prompt-file>
-```
+Set `search.hook_timeout_sec` or `AVO_HOOK_TIMEOUT` so a hung scorer or agent becomes a recorded tick
+error instead of a silent stall.
 
 ## Model tiers
 

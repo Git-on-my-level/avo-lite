@@ -3,6 +3,7 @@ import os
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -301,6 +302,101 @@ class AvoIntegrationTests(unittest.TestCase):
         self.assertEqual(entries[-1]["tick"], 2)
         self.assertFalse(stale.exists())
         self.assertIsNone(self.state()["active_run"])
+
+    def test_init_requires_agent(self):
+        result = self.avo("init", "demo", "--goal", "maximize", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--agent", result.stderr)
+        self.assertFalse((self.repo / ".avo" / "config.json").exists())
+
+    def test_init_rejects_invalid_baseline_score(self):
+        agent = self.write_python_hook("agent.py", "import sys\n")
+        score = self.write_python_hook(
+            "score.py",
+            """
+            print("not-json")
+            """,
+        )
+        result = self.avo(
+            "init", "demo", "--goal", "maximize", "--agent", str(agent), "--score", str(score), check=False
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("baseline", result.stderr.lower())
+        self.assertFalse((self.repo / ".avo" / "config.json").exists())
+
+    def test_hung_scorer_is_timeout_error(self):
+        self.init_value_task(
+            0,
+            """
+            import pathlib, sys
+            pathlib.Path(sys.argv[1], "value.txt").write_text("1\\n")
+            """,
+            """
+            import json, pathlib, sys
+            value = int(pathlib.Path(sys.argv[1], "value.txt").read_text())
+            print(json.dumps({"correct": True, "objective": value, "metrics": {}, "note": "ok"}))
+            """,
+        )
+        hung = self.write_python_hook(
+            "hung.py",
+            """
+            import time
+            time.sleep(30)
+            """,
+        )
+        config = self.config()
+        config["cmd"]["score"] = str(hung)
+        config["search"]["hook_timeout_sec"] = 1
+        self.write_config(config)
+        started = time.time()
+        self.avo("tick")
+        self.assertLess(time.time() - started, 10)
+        entry = self.ledger()[-1]
+        self.assertEqual(entry["action"], "error")
+        self.assertIn("timeout", entry["note"].lower())
+
+    def test_knowledge_is_visible_in_worktree_and_not_committed(self):
+        knowledge = self.repo / "k"
+        knowledge.mkdir()
+        (knowledge / "INDEX.md").write_text("# Knowledge index\n\n- ref.md\n", encoding="utf-8")
+        (knowledge / "ref.md").write_text("secret-reference\n", encoding="utf-8")
+        self.write("seed.txt", "seed\n")
+        agent = self.write_python_hook(
+            "agent.py",
+            """
+            import pathlib, sys
+            root = pathlib.Path(sys.argv[1])
+            text = (root / ".avo" / "knowledge" / "ref.md").read_text()
+            (root / "seen.txt").write_text(text)
+            """,
+        )
+        score = self.write_python_hook(
+            "score.py",
+            """
+            import json, pathlib, sys
+            seen = (pathlib.Path(sys.argv[1]) / "seen.txt").exists()
+            print(json.dumps({"correct": seen, "objective": 1 if seen else 0, "metrics": {}, "note": "seen" if seen else "missing"}))
+            """,
+        )
+        self.avo(
+            "init",
+            "demo",
+            "--goal",
+            "use knowledge",
+            "--agent",
+            str(agent),
+            "--score",
+            str(score),
+            "--k",
+            str(knowledge),
+        )
+        self.avo("tick")
+        self.assertEqual((self.repo / "seen.txt").read_text(), "secret-reference\n")
+        self.assertEqual(self.ledger()[-1]["action"], "accept")
+        tracked = self.cmd("git", "ls-files").stdout
+        self.assertNotIn(".avo/knowledge", tracked)
+        prompt = (self.repo / ".avo" / "runs" / "000001" / "prompt.md").read_text()
+        self.assertIn(".avo/knowledge/INDEX.md", prompt)
 
 
 if __name__ == "__main__":

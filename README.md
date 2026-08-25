@@ -57,10 +57,33 @@ avo status
 ```
 
 `avo init` creates and checks out `avo/<task>`, captures the current project as baseline v0, and
-scores that baseline. Without `--score`, the task starts in preview mode: the agent runs and each diff
-is saved, but no candidate is accepted.
+scores that baseline. `--agent` is required: a command that edits a candidate directory. Without
+`--score`, the task starts in preview mode: the agent runs and each diff is saved, but no candidate
+is accepted. If `--score` is given and the baseline score is invalid, init fails and does not leave
+`.avo/` behind.
 
-The default Claude Code adapter is used when `--agent` is omitted.
+## Agent adapter
+
+AVO does not ship a default model CLI. Write a small executable that implements:
+
+```text
+adapter <candidate-dir> <prompt-file>
+```
+
+It must `cd` into the candidate (or otherwise edit that tree in place), run whatever agent you have,
+and exit 0 when the tree is ready to score. AVO sets `AVO_TICK`, `AVO_DRIVER_MODEL`, and
+`AVO_SUPERVISOR_MODEL`.
+
+```bash
+#!/bin/sh
+# ./agent.sh — replace the inner command with yours
+set -eu
+cd "$1"
+your-agent --prompt-file "$2"
+```
+
+Example wrappers live in [`scripts/adapters/`](scripts/adapters/). They are references, not defaults.
+See [`references/harness-bindings.md`](references/harness-bindings.md).
 
 ## Where runs live
 
@@ -89,6 +112,10 @@ By default all local state is under the project root:
 ```
 
 AVO adds `/.avo/` to `.git/info/exclude`, not the tracked `.gitignore`.
+
+`--k DIR` copies reference material into `.avo/knowledge/` at init. Each tick copies that tree into
+the candidate as `.avo/knowledge/` so the agent can read it. Those files stay excluded from the
+candidate patch; do not expect `--k` to become a tracked commit.
 
 A worktree inside `.avo/runs/...` is supported by Git. It is not an independent nested repository:
 its `.git` is a small pointer file to the parent repository's worktree metadata. Once a tick reaches a
@@ -154,7 +181,8 @@ max(search.min_improvement_abs, metrics.stddev)
 ```
 
 In `discover` mode, every correct candidate is accepted. `objective` may be a monotone coverage
-counter or `null`.
+counter or `null`. If shrinkage is invalid, the scorer must set `correct=false`; the kernel does not
+reject a smaller objective in discover mode.
 
 ### Adversarial verifier
 
@@ -274,6 +302,7 @@ AVO_DRIVER_MODEL
 AVO_SUPERVISOR_MODEL
 AVO_HOME
 AVO_QUIET
+AVO_HOOK_TIMEOUT
 ```
 
 Important search defaults:
@@ -289,10 +318,14 @@ Important search defaults:
     "reject_ratio": 0.8,
     "repeat_edit_max": 3,
     "max_redirects": 2,
-    "score_on_agent_error": false
+    "score_on_agent_error": false,
+    "hook_timeout_sec": 0
   }
 }
 ```
+
+`hook_timeout_sec` / `AVO_HOOK_TIMEOUT` is seconds. `0` means no limit. A timed-out hook is a tick
+error, not a hang.
 
 ## Existing v1 tasks
 

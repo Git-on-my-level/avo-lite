@@ -247,9 +247,9 @@ They are deliberately stored in a boring Markdown file: `.avo/pins.md`.
 
 ## Stagnation
 
-Stagnation is detected without an LLM from terminal attempt ledger entries, including infrastructure errors. The default checks are:
+Stagnation is detected without an LLM from terminal attempt ledger entries, including infrastructure errors. A flaky scorer or agent is supposed to stall the search so a human notices; retries and backoff belong in the outer scheduler (cron, systemd, GitHub Actions), not inside `avo run`. The default checks are:
 
-- eight attempts since the last accept, redirect, or human resume;
+- eight attempts since the last accept, redirect, or human resume (accepts, rejects, and errors all count);
 - repeated identical diffs in a full cycle window;
 - a high rejection ratio in a full cycle window.
 
@@ -277,7 +277,7 @@ avo-stall-detect
 ```text
 avo init <task> ...          initialize and score baseline v0
 avo tick [--force]           run one isolated attempt
-avo run [--max-ticks N]      run bounded repeated attempts; 0 is unbounded
+avo run [--max-ticks N]      run bounded repeated attempts; 0 is unbounded; stops on the first infrastructure failure
 avo supervise [reason]       request a redirect manually
 avo reflect                  refresh memory.md
 avo pin <text>               add a human pin

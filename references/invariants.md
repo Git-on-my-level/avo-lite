@@ -49,9 +49,11 @@ infrastructure error.
 
 ## 9. Stagnation is deterministic; redirection is rare
 
-Ledger statistics detect stalls. The supervisor reads the meaningful trajectory, including failures,
-and emits a one-shot redirect. Redirects and human resumes start fresh detection windows. Repeated
-failure eventually halts paid ticks for human review.
+Ledger statistics detect stalls, counting infrastructure errors as attempts so a flaky evaluator
+cannot spin forever. `avo run` exits nonzero on the first infrastructure failure; retries belong in
+the outer scheduler. The supervisor reads the meaningful trajectory, including failures, and emits a
+one-shot redirect. Redirects and human resumes start fresh detection windows. Repeated failure
+eventually halts paid ticks for human review.
 
 ## 10. Human pins outrank generated strategy
 

@@ -112,7 +112,9 @@ By default all local state is under the project root:
         └── verify.json
 ```
 
-AVO adds `/.avo/` to `.git/info/exclude`, not the tracked `.gitignore`.
+AVO adds `/.avo/` to `.git/info/exclude`, not the tracked `.gitignore`. Runtime `.avo/knowledge` is also explicitly removed from candidate patches, including when `AVO_HOME` is outside the repository.
+
+The candidate patch is frozen before evaluation. If scoring or verification mutates candidate source, AVO records an infrastructure error rather than accepting a commit different from the tree that was evaluated. Evaluators should write evidence outside candidate source when possible; any candidate-side evidence named in the scorer/verifier contract is retained before worktree cleanup.
 
 `--k DIR` copies reference material into `.avo/knowledge/` at init. Each tick copies that tree into
 the candidate as `.avo/knowledge/` so the agent can read it. Those files stay excluded from the
@@ -161,7 +163,7 @@ score-command <candidate-dir>
 It prints exactly one JSON object and exits:
 
 - `0` when evaluation completed, whether correctness passed or failed;
-- nonzero only for infrastructure or execution failure.
+- nonzero only for infrastructure or execution failure. AVO propagates infrastructure failures as a nonzero `avo tick`/`avo run` exit so schedulers cannot mistake a broken iteration for success.
 
 ```json
 {
@@ -203,7 +205,7 @@ accepted. It prints exactly one JSON object:
 ```
 
 Exit 0 means verification completed, regardless of verdict. Nonzero means verifier infrastructure
-failure and records a tick error rather than a candidate rejection.
+failure and records a tick error rather than a candidate rejection. Files named in `evidence` are retained under their collision-safe relative paths in `runs/<tick>/artifacts/verify/`; scorer `artifacts` are retained under `artifacts/score/`.
 
 ### Supervisor
 
@@ -245,9 +247,9 @@ They are deliberately stored in a boring Markdown file: `.avo/pins.md`.
 
 ## Stagnation
 
-Stagnation is detected without an LLM from candidate ledger entries. The default checks are:
+Stagnation is detected without an LLM from terminal attempt ledger entries, including infrastructure errors. The default checks are:
 
-- eight candidate attempts since the last accept, redirect, or human resume;
+- eight attempts since the last accept, redirect, or human resume;
 - repeated identical diffs in a full cycle window;
 - a high rejection ratio in a full cycle window.
 

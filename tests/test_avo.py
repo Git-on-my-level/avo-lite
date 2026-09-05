@@ -349,7 +349,8 @@ class AvoIntegrationTests(unittest.TestCase):
         config["search"]["hook_timeout_sec"] = 1
         self.write_config(config)
         started = time.time()
-        self.avo("tick")
+        result = self.avo("tick", check=False)
+        self.assertNotEqual(result.returncode, 0)
         self.assertLess(time.time() - started, 10)
         entry = self.ledger()[-1]
         self.assertEqual(entry["action"], "error")
@@ -430,6 +431,133 @@ class AvoIntegrationTests(unittest.TestCase):
         self.avo("tick", env={"AVO_EXEC": str(inner)})
         self.assertEqual((self.repo / "value.txt").read_text(), "1\n")
         self.assertEqual(self.ledger()[-1]["action"], "accept")
+
+    def test_scorer_mutation_cannot_be_accepted(self):
+        self.init_value_task(
+            0,
+            """
+            import pathlib, sys
+            pathlib.Path(sys.argv[1], "value.txt").write_text("1\\n")
+            """,
+            """
+            import json, pathlib, sys
+            root = pathlib.Path(sys.argv[1])
+            value = int((root / "value.txt").read_text())
+            if value == 1:
+                (root / "value.txt").write_text("100\\n")
+                value = 100
+            print(json.dumps({"correct": True, "objective": value, "metrics": {}, "note": "score"}))
+            """,
+        )
+        result = self.avo("tick", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.repo / "value.txt").read_text(), "0\n")
+        self.assertEqual(self.ledger()[-1]["action"], "error")
+        self.assertIn("changed during scoring", self.ledger()[-1]["note"])
+
+    def test_recovery_preserves_unrelated_canonical_edits(self):
+        agent = self.write_python_hook("agent.py", "import sys\n")
+        self.write("seed.txt", "seed\n")
+        self.avo("init", "demo", "--goal", "progress", "--agent", str(agent))
+        base = self.cmd("git", "rev-parse", "HEAD").stdout.strip()
+        state = self.state()
+        state["tick"] = 1
+        state["active_run"] = {
+            "tick": 1, "phase": "agent", "base_commit": base,
+            "worktree": str(self.repo / ".avo" / "runs" / "000001" / "worktree"),
+            "run_dir": "runs/000001",
+        }
+        (self.repo / ".avo" / "state.json").write_text(json.dumps(state, indent=2) + "\n")
+        (self.repo / "seed.txt").write_text("human-edit\n")
+        # Recovery runs before the cleanliness guard; the edit must survive.
+        result = self.avo("pin", "preserve", check=False)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual((self.repo / "seed.txt").read_text(), "human-edit\n")
+
+    def test_external_avo_home_knowledge_is_not_committed(self):
+        external = self.repo.parent / (self.repo.name + "-avo-home")
+        knowledge = self.repo.parent / (self.repo.name + "-knowledge-source")
+        knowledge.mkdir(parents=True)
+        (knowledge / "INDEX.md").write_text("# Runtime knowledge\n")
+        self.write("value.txt", "0\n")
+        agent = self.write_python_hook(
+            "agent.py",
+            """
+            import pathlib, sys
+            root = pathlib.Path(sys.argv[1])
+            assert (root / ".avo" / "knowledge" / "INDEX.md").exists()
+            (root / "value.txt").write_text("1\\n")
+            """,
+        )
+        score = self.write_python_hook(
+            "score.py",
+            """
+            import json, pathlib, sys
+            value = int((pathlib.Path(sys.argv[1]) / "value.txt").read_text())
+            print(json.dumps({"correct": True, "objective": value, "metrics": {}, "note": "ok"}))
+            """,
+        )
+        env = {"AVO_HOME": str(external)}
+        self.avo("init", "demo", "--goal", "maximize", "--agent", str(agent), "--score", str(score), "--k", str(knowledge), env=env)
+        self.avo("tick", env=env)
+        self.assertNotIn(".avo/knowledge", self.cmd("git", "ls-files").stdout)
+
+    def test_artifacts_preserve_relative_paths_and_verifier_evidence(self):
+        verifier = self.write_python_hook(
+            "verify.py",
+            """
+            import json, pathlib, sys
+            root = pathlib.Path(sys.argv[1])
+            (root / "verify").mkdir(exist_ok=True)
+            (root / "verify" / "proof.txt").write_text("proof\\n")
+            print(json.dumps({"pass": True, "note": "ok", "evidence": ["verify/proof.txt"]}))
+            """,
+        )
+        self.write("value.txt", "0\n")
+        agent = self.write_python_hook(
+            "agent.py",
+            """
+            import pathlib, sys
+            root = pathlib.Path(sys.argv[1])
+            (root / "value.txt").write_text("1\\n")
+            for d in ("control", "treatment"):
+                (root / d).mkdir(exist_ok=True)
+                (root / d / "result.json").write_text(d)
+            """,
+        )
+        score = self.write_python_hook(
+            "score.py",
+            """
+            import json, pathlib, sys
+            root = pathlib.Path(sys.argv[1])
+            value = int((root / "value.txt").read_text())
+            print(json.dumps({"correct": True, "objective": value, "metrics": {}, "note": "ok",
+                              "artifacts": ["control/result.json", "treatment/result.json"]}))
+            """,
+        )
+        self.avo("init", "demo", "--goal", "maximize", "--agent", str(agent), "--score", str(score), "--verify", str(verifier))
+        self.avo("tick")
+        artifacts = self.repo / ".avo" / "runs" / "000001" / "artifacts"
+        self.assertEqual((artifacts / "score" / "control" / "result.json").read_text(), "control")
+        self.assertEqual((artifacts / "score" / "treatment" / "result.json").read_text(), "treatment")
+        self.assertEqual((artifacts / "verify" / "verify" / "proof.txt").read_text(), "proof\n")
+
+    def test_agent_failure_is_nonzero_and_counts_toward_stall(self):
+        agent = self.write_python_hook("agent.py", "raise SystemExit(7)\n")
+        score = self.write_python_hook(
+            "score.py",
+            'import json\nprint(json.dumps({"correct": True, "objective": 0, "metrics": {}, "note": "unused"}))\n',
+        )
+        self.write("seed.txt", "seed\n")
+        self.avo("init", "demo", "--goal", "progress", "--agent", str(agent), "--score", str(score))
+        config = self.config()
+        config["search"]["stall_window"] = 2
+        self.write_config(config)
+        self.assertNotEqual(self.avo("tick", check=False).returncode, 0)
+        self.assertNotEqual(self.avo("tick", check=False).returncode, 0)
+        detected = self.avo("stall-detect", check=False)
+        self.assertEqual(detected.returncode, 0)
+        self.assertIn("stall", detected.stderr.lower() + detected.stdout.lower())
 
 
 if __name__ == "__main__":

@@ -17,7 +17,14 @@ if sh -c "$CORRECT_CMD" >"$correct_log" 2>&1; then correct=true; fi
 
 objective=null
 if [ "$correct" = true ]; then
-  objective=$(sh -c "$METRIC_CMD" 2>"$metric_log" | grep -Eo '[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?' | head -1)
+  metric_output=$(mktemp "${TMPDIR:-/tmp}/avo-metric-output.XXXXXX") || exit 3
+  trap 'rm -f "$correct_log" "$metric_log" "$metric_output"' EXIT
+  if ! sh -c "$METRIC_CMD" >"$metric_output" 2>"$metric_log"; then
+    echo "score-ci: metric command failed" >&2
+    tail -5 "$metric_log" >&2 || true
+    exit 3
+  fi
+  objective=$(grep -Eo '[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?' "$metric_output" | head -1)
   [ -n "$objective" ] || { echo "score-ci: metric command produced no number" >&2; exit 3; }
   note="tests pass; metric=$objective"
 else

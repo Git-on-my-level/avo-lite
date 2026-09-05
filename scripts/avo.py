@@ -543,6 +543,18 @@ def run_hook(
                 os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
             return HookResult(124, stdout_path, stderr_path, timed_out=True)
+        except KeyboardInterrupt:
+            # AVO owns the hook process group. Never release the task lock while a
+            # cancelled agent/scorer/verifier is still running against its worktree.
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+            raise
     return HookResult(proc.returncode, stdout_path, stderr_path)
 
 
@@ -616,22 +628,26 @@ def decide_accept(task: Task, state: Dict[str, Any], score: Dict[str, Any]) -> T
     return float(objective) > float(best) + margin, delta, margin
 
 
-def copy_artifacts(score: Dict[str, Any], candidate: Path, run_dir: Path) -> None:
-    artifacts = score.get("artifacts") or []
-    destination = run_dir / "artifacts"
+def copy_evidence_paths(paths: Sequence[str], candidate: Path, run_dir: Path, kind: str) -> None:
+    destination = run_dir / "artifacts" / kind
     candidate_resolved = candidate.resolve()
-    for raw in artifacts:
+    for raw in paths:
         source = (candidate / raw).resolve()
         try:
-            source.relative_to(candidate_resolved)
+            relative = source.relative_to(candidate_resolved)
         except ValueError:
-            warn("skipping artifact outside candidate: {}".format(raw))
+            warn("skipping evidence outside candidate: {}".format(raw))
             continue
         if not source.is_file():
-            warn("skipping missing/non-file artifact: {}".format(raw))
+            warn("skipping missing/non-file evidence: {}".format(raw))
             continue
-        destination.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(source), str(destination / source.name))
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(source), str(target))
+
+
+def copy_artifacts(score: Dict[str, Any], candidate: Path, run_dir: Path) -> None:
+    copy_evidence_paths(score.get("artifacts") or [], candidate, run_dir, "score")
 
 
 def create_worktree(task: Task, path: Path, base_commit: str) -> None:
@@ -671,13 +687,47 @@ def cleanup_orphan_worktrees(task: Task, active_path: Optional[str] = None) -> N
         remove_worktree(task, path)
 
 
-def build_patch(candidate: Path, base_commit: str, patch_path: Path) -> Tuple[str, bool]:
+def build_patch(
+    candidate: Path, base_commit: str, patch_path: Path, exclude_paths: Sequence[str] = ()
+) -> Tuple[str, bool]:
     git(candidate, ["reset", "--soft", base_commit])
     git(candidate, ["add", "-A"])
+    # Runtime knowledge is context, never candidate output. This remains true even
+    # when AVO_HOME lives outside the repository and therefore cannot be excluded
+    # by the canonical worktree's local exclude file.
+    for raw in [".avo/knowledge"] + list(exclude_paths):
+        git(candidate, ["reset", "-q", "--", raw], check=False)
     result = git(candidate, ["diff", "--cached", "--binary", "--full-index", base_commit], capture=True)
     data = result.stdout.encode("utf-8", errors="surrogateescape")
     patch_path.write_bytes(data)
     return hashlib.sha256(data).hexdigest()[:16], bool(data)
+
+
+def candidate_changed_paths(candidate: Path, base_commit: str) -> set:
+    raw = git_text(candidate, ["diff", "--cached", "--name-only", base_commit])
+    return {line for line in raw.splitlines() if line}
+
+
+def assert_candidate_unchanged(
+    candidate: Path, base_commit: str, expected_patch: Path, run_dir: Path,
+    initial_paths: Sequence[str], declared_evidence: Sequence[str],
+) -> None:
+    initial = set(initial_paths)
+    safe_generated: List[str] = []
+    for raw in declared_evidence:
+        if raw in initial:
+            continue
+        # Only newly-created, previously-untracked declared evidence may be ignored.
+        # A verifier cannot whitelist mutation of a baseline/source path by naming it evidence.
+        tracked = git(candidate, ["cat-file", "-e", "{}:{}".format(base_commit, raw)], check=False).returncode == 0
+        if not tracked:
+            safe_generated.append(raw)
+    observed = run_dir / "evaluated.patch"
+    build_patch(candidate, base_commit, observed, safe_generated)
+    if observed.read_bytes() != expected_patch.read_bytes():
+        raise AvoError(
+            "candidate source changed during scoring/verification; refusing to accept content that was not evaluated exactly"
+        )
 
 
 def run_relative(task: Task, run_dir: Path) -> str:
@@ -864,7 +914,7 @@ def detect_stall_entries(
     for index, entry in enumerate(entries):
         if entry.get("action") in ("accept", "redirect", "resume"):
             segment_start = index + 1
-    candidates = [entry for entry in entries[segment_start:] if entry.get("action") in ("accept", "reject")]
+    candidates = [entry for entry in entries[segment_start:] if entry.get("action") in ("accept", "reject", "error")]
     if not candidates:
         return ""
     since_progress = len(candidates)
@@ -948,7 +998,11 @@ def recover_interrupted(task: Task, state: Dict[str, Any]) -> Dict[str, Any]:
                 warn("recovered accepted tick {} after interruption".format(tick))
         if not recovered_accept:
             if base and current == base:
-                git(task.root, ["reset", "--hard", base], check=False)
+                # Before finalization, AVO only mutates disposable worktrees. Any
+                # uncommitted canonical edits therefore belong to someone else and
+                # must be preserved. Finalization recovery is handled above using
+                # the recorded commit identity, never by guessing ownership.
+                pass
             elif base and current != base:
                 raise AvoError(
                     "interrupted run {} left canonical HEAD at unexpected commit {}; inspect before continuing".format(tick, current)
@@ -1041,6 +1095,7 @@ def verify_candidate(task: Task, candidate: Path, run_dir: Path) -> Tuple[Option
     try:
         value = load_one_json(run_dir / "verify.json", "verify")
         validate_verify(value)
+        copy_evidence_paths(value.get("evidence") or [], candidate, run_dir, "verify")
         return value, None
     except AvoError as exc:
         return None, "invalid verify result: {}".format(exc)
@@ -1405,6 +1460,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
             active["phase"] = "capturing"
             set_active(task, state, active)
             diff_hash, has_diff = build_patch(worktree, base, run_dir / "diff.patch")
+            initial_paths = sorted(candidate_changed_paths(worktree, base))
             active["diff_hash"] = diff_hash
             set_active(task, state, active)
 
@@ -1435,7 +1491,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 }
                 finish_run(task, state, entry, worktree)
                 report_event(task, "tick {} error: agent timeout".format(tick))
-                return 0
+                return 1
             if result.returncode != 0 and not (score_on_error and has_diff):
                 entry = {
                     "tick": tick,
@@ -1448,7 +1504,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 }
                 finish_run(task, state, entry, worktree)
                 report_event(task, "tick {} error: agent exited {}".format(tick, result.returncode))
-                return 0
+                return 1
             if not has_diff:
                 entry = {
                     "tick": tick,
@@ -1483,7 +1539,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
                 }
                 finish_run(task, state, entry, worktree)
                 report_event(task, "tick {} error: {}".format(tick, score_error))
-                return 0
+                return 1
             assert score is not None
             accept, delta, margin = decide_accept(task, state, score)
             verify: Optional[Dict[str, Any]] = None
@@ -1508,9 +1564,29 @@ def cmd_tick(args: argparse.Namespace) -> int:
                     }
                     finish_run(task, state, entry, worktree)
                     report_event(task, "tick {} error: {}".format(tick, verify_error))
-                    return 0
+                    return 1
                 if verify is not None and not verify["pass"]:
                     accept = False
+
+            if accept:
+                try:
+                    declared_evidence = list(score.get("artifacts") or [])
+                    if verify is not None:
+                        declared_evidence += list(verify.get("evidence") or [])
+                    assert_candidate_unchanged(
+                        worktree, base, run_dir / "diff.patch", run_dir, initial_paths, declared_evidence
+                    )
+                except AvoError as exc:
+                    entry = {
+                        "tick": tick, "action": "error", "correct": score.get("correct"),
+                        "objective": score.get("objective"), "delta": 0, "note": str(exc),
+                        "parent": base, "diff_hash": diff_hash, "agent_model": task.model("driver"),
+                        "metrics": score.get("metrics", {}), "verify": verify,
+                        "run_dir": run_relative(task, run_dir),
+                    }
+                    finish_run(task, state, entry, worktree)
+                    report_event(task, "tick {} error: {}".format(tick, exc))
+                    return 1
 
             note = str(score.get("note") or "")
             if verify is not None and not verify.get("pass", True):
@@ -1541,7 +1617,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
                     entry["delta"] = 0
                     finish_run(task, state, entry, worktree)
                     report_event(task, "tick {} error: {}".format(tick, entry["note"]))
-                    return 0
+                    return 1
                 entry["commit"] = commit
                 state = finish_run(task, state, entry, worktree)
                 objective = score.get("objective")
@@ -1572,8 +1648,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         if state.get("status") == "stalled":
             info("stopping: task is stalled")
             break
-        cmd_tick(argparse.Namespace(force=False))
+        rc = cmd_tick(argparse.Namespace(force=False))
         completed += 1
+        if rc != 0:
+            info("stopping: tick failed")
+            return rc
         state = task.read_state()
         if state.get("status") == "stalled":
             info("stopping: task is stalled")

@@ -242,6 +242,9 @@ AVO evidence and write ordinary files or pins rather than becoming required cont
 - Mutating commands use an atomic local lock.
 - A hard interruption leaves canonical Git state unchanged during agent/score/verify phases.
 - The next mutating command removes stale worktrees and records the interrupted tick.
+- Committing to the task branch between ticks is supported human steering: an interrupted run whose
+  base advanced only through commits AVO did not author recovers normally, and the next tick
+  continues from current HEAD.
 - Accepted finalization is recoverable if Git committed before state persistence completed.
 - A bare `avo run` is bounded to 20 ticks; pass `--max-ticks 0` explicitly for an unbounded run.
 - Reports are redacted, but the source ledger is not.

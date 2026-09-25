@@ -1068,16 +1068,22 @@ def check_evaluator_revision(task: Task, state: Dict[str, Any]) -> None:
         )
 
 
-def advanced_by_merges_only(root: Path, base: str, current: str) -> bool:
-    """True when HEAD moved from base only through merge commits (an upstream
-    sync), never through a single-parent commit such as an AVO finalization."""
+def advanced_by_external_commits_only(root: Path, base: str, current: str) -> bool:
+    """True when HEAD moved from base only through commits AVO did not author.
+
+    Between ticks the task branch is writable by humans, and scheduler wrappers may
+    merge upstream while a run is dead. Every commit AVO creates on the task branch
+    carries an 'avo: ' subject (baseline init, accepted ticks), so a first-parent
+    chain without one cannot hide a half-finalized accept and is safe to recover
+    from: the next tick continues from current HEAD.
+    """
     if git(root, ["merge-base", "--is-ancestor", base, current], check=False).returncode != 0:
         return False
-    listing = git(root, ["rev-list", "--first-parent", "--parents", "{}..{}".format(base, current)], check=False)
+    listing = git(root, ["log", "--first-parent", "--format=%s", "{}..{}".format(base, current)], check=False)
     if listing.returncode != 0:
         return False
-    rows = [line.split() for line in listing.stdout.splitlines() if line.strip()]
-    return bool(rows) and all(len(row) >= 3 for row in rows)
+    subjects = listing.stdout.splitlines()
+    return bool(subjects) and not any(subject.startswith("avo: ") for subject in subjects)
 
 
 def recover_interrupted(task: Task, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1113,11 +1119,12 @@ def recover_interrupted(task: Task, state: Dict[str, Any]) -> Dict[str, Any]:
                 # must be preserved. Finalization recovery is handled above using
                 # the recorded commit identity, never by guessing ownership.
                 pass
-            elif base and current and advanced_by_merges_only(task.root, base, current):
-                # Something synced upstream into the task branch while the run was
-                # dead (a scheduler wrapper, or 'avo sync' after manual cleanup).
-                # Merges cannot be an AVO finalization, so the run simply failed.
-                phase = "{}; canonical advanced by merge to {}".format(phase, current[:12])
+            elif base and current and advanced_by_external_commits_only(task.root, base, current):
+                # Humans committed on the task branch between ticks (the
+                # writable window), or something synced upstream while the run
+                # was dead. None of that can be an AVO finalization, so the run
+                # simply failed; the next tick continues from current HEAD.
+                phase = "{}; canonical advanced by external commits to {}".format(phase, current[:12])
             elif base and current != base:
                 raise AvoError(
                     "interrupted run {} left canonical HEAD at unexpected commit {}; inspect before continuing".format(tick, current)

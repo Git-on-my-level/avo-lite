@@ -44,6 +44,21 @@ A multi-step launcher example lives at `$AVO/adapters/agent-agentctl.sh`.
 */30 * * * * cd /path/to/project && /path/to/avo tick >> .avo/cron.log 2>&1
 ```
 
+To follow a moving upstream, sync inside the same scheduled command so a conflict stops the tick
+instead of leaving a half-merged checkout:
+
+```cron
+0 */2 * * * cd /path/to/project && git fetch -q origin && /path/to/avo sync origin/main && /path/to/avo tick >> .avo/cron.log 2>&1
+```
+
+Run ticks from the operating-system scheduler (cron, systemd, launchd) rather than inside a
+long-lived chat or agent gateway process: restarting the gateway kills the tick mid-run. Point an
+external monitor at `avo status --json` and alert when `last_accept_at` or `active_run.started_at`
+is older than the task's expected cadence.
+
+If several controllers share one checkout, serialize them with a lock that waits a bounded time.
+A lock that gives up immediately can lose the race on every fire and skip work silently.
+
 A task marked `stalled` rejects future ticks until `avo resume`, preventing an unattended scheduler
 from spending indefinitely after the configured redirects fail.
 

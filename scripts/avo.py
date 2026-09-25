@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -27,6 +28,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 VERSION = 2
 TERMINAL_ACTIONS = {"accept", "reject", "error", "preview"}
+# Bump when decide_accept() semantics change. It is part of the evaluator
+# revision, so a kernel upgrade that moves the acceptance bar forces an explicit
+# rebaseline instead of silently comparing scores under a different rule.
+ACCEPTANCE_RULE = "rank-margin-v1"
+# Actions that start a fresh stall-detection segment.
+SEGMENT_START_ACTIONS = ("accept", "redirect", "resume", "rebaseline")
 
 
 class AvoError(RuntimeError):
@@ -424,6 +431,8 @@ def append_ledger(task: Task, entry: Dict[str, Any]) -> None:
         "verify": entry.get("verify"),
         "run_dir": entry.get("run_dir"),
     }
+    if entry.get("evaluator_rev"):
+        record["evaluator_rev"] = entry["evaluator_rev"]
     with task.ledger_path.open("a", encoding="utf-8") as handle:
         handle.write(json_dumps(record) + "\n")
         handle.flush()
@@ -912,7 +921,7 @@ def detect_stall_entries(
     # A successful accept, a supervisor redirect, or an explicit human resume starts a fresh search segment.
     segment_start = 0
     for index, entry in enumerate(entries):
-        if entry.get("action") in ("accept", "redirect", "resume"):
+        if entry.get("action") in SEGMENT_START_ACTIONS:
             segment_start = index + 1
     candidates = [entry for entry in entries[segment_start:] if entry.get("action") in ("accept", "reject", "error")]
     if not candidates:
@@ -970,6 +979,107 @@ def sync_state_from_entry(state: Dict[str, Any], entry: Dict[str, Any]) -> None:
         state["status"] = state.get("status", "running")
 
 
+def _hash_path(path: Path, digest: "hashlib._Hash") -> None:
+    if path.is_dir():
+        for child in sorted(p for p in path.rglob("*") if p.is_file()):
+            digest.update(str(child.relative_to(path)).encode("utf-8") + b"\0")
+            digest.update(child.read_bytes())
+    else:
+        digest.update(path.read_bytes())
+
+
+def _looks_like_script(path: Path) -> bool:
+    """Commands name interpreters too; only text files (scorer scripts) are part
+    of the evaluator by default. List anything else in ``evaluator.paths``."""
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(8192)
+    except OSError:
+        return False
+    return b"\0" not in head and path.stat().st_size <= 5 * 1024 * 1024
+
+
+def evaluator_fingerprint(task: Task) -> Tuple[str, Dict[str, str]]:
+    """Identify the evaluation contract that makes objectives comparable.
+
+    Covers the scorer and verifier commands, any files those commands name,
+    extra paths listed in ``evaluator.paths``, the mode, the configured noise
+    margin, and the kernel's acceptance rule. Objectives recorded under one
+    revision are never ranked against a different one.
+    """
+    parts: Dict[str, str] = {
+        "mode": task.mode,
+        "acceptance_rule": ACCEPTANCE_RULE,
+        "min_improvement_abs": json_dumps(task.setting("search", "min_improvement_abs", 0)),
+    }
+    paths: List[Tuple[str, Path]] = []
+    for name in ("score", "verify"):
+        command = task.command(name)
+        parts["cmd." + name] = command
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+        for token in tokens:
+            candidate = Path(token).expanduser()
+            if not candidate.is_absolute():
+                candidate = task.root / candidate
+            if candidate.is_file() and _looks_like_script(candidate):
+                paths.append(("file." + name + ":" + token, candidate))
+    extra = task.setting("evaluator", "paths", []) or []
+    if not isinstance(extra, list) or not all(isinstance(item, str) for item in extra):
+        raise AvoError("evaluator.paths must be an array of path strings")
+    for item in extra:
+        candidate = Path(item).expanduser()
+        if not candidate.is_absolute():
+            candidate = task.root / candidate
+        if not candidate.exists():
+            raise AvoError("evaluator.paths entry does not exist: {}".format(item))
+        paths.append(("path:" + item, candidate))
+    for label, path in paths:
+        digest = hashlib.sha256()
+        _hash_path(path, digest)
+        parts[label] = digest.hexdigest()[:16]
+    combined = hashlib.sha256(json_dumps(sorted(parts.items())).encode("utf-8")).hexdigest()[:16]
+    return combined, parts
+
+
+def changed_evaluator_parts(old: Dict[str, str], new: Dict[str, str]) -> List[str]:
+    return sorted(key for key in set(old) | set(new) if old.get(key) != new.get(key))
+
+
+def check_evaluator_revision(task: Task, state: Dict[str, Any]) -> None:
+    """Refuse to rank under a different evaluator than the current best."""
+    rev, parts = evaluator_fingerprint(task)
+    recorded = state.get("evaluator_rev")
+    if not recorded:
+        # Tasks created before evaluator revisions existed adopt the current one.
+        state["evaluator_rev"] = rev
+        state["evaluator_parts"] = parts
+        task.write_state(state)
+        info("recorded evaluator revision {}".format(rev))
+        return
+    if recorded != rev:
+        changed = changed_evaluator_parts(state.get("evaluator_parts") or {}, parts)
+        raise AvoError(
+            "evaluator changed since the current best was scored ({} -> {}; changed: {}). Objectives are not "
+            "comparable across evaluator revisions; review the change, then run 'avo rebaseline' to rescore HEAD "
+            "under the new evaluator".format(recorded, rev, ", ".join(changed) or "unknown")
+        )
+
+
+def advanced_by_merges_only(root: Path, base: str, current: str) -> bool:
+    """True when HEAD moved from base only through merge commits (an upstream
+    sync), never through a single-parent commit such as an AVO finalization."""
+    if git(root, ["merge-base", "--is-ancestor", base, current], check=False).returncode != 0:
+        return False
+    listing = git(root, ["rev-list", "--first-parent", "--parents", "{}..{}".format(base, current)], check=False)
+    if listing.returncode != 0:
+        return False
+    rows = [line.split() for line in listing.stdout.splitlines() if line.strip()]
+    return bool(rows) and all(len(row) >= 3 for row in rows)
+
+
 def recover_interrupted(task: Task, state: Dict[str, Any]) -> Dict[str, Any]:
     active = state.get("active_run")
     if not isinstance(active, dict):
@@ -1003,6 +1113,11 @@ def recover_interrupted(task: Task, state: Dict[str, Any]) -> Dict[str, Any]:
                 # must be preserved. Finalization recovery is handled above using
                 # the recorded commit identity, never by guessing ownership.
                 pass
+            elif base and current and advanced_by_merges_only(task.root, base, current):
+                # Something synced upstream into the task branch while the run was
+                # dead (a scheduler wrapper, or 'avo sync' after manual cleanup).
+                # Merges cannot be an AVO finalization, so the run simply failed.
+                phase = "{}; canonical advanced by merge to {}".format(phase, current[:12])
             elif base and current != base:
                 raise AvoError(
                     "interrupted run {} left canonical HEAD at unexpected commit {}; inspect before continuing".format(tick, current)
@@ -1041,6 +1156,8 @@ def finish_run(
     entry: Dict[str, Any],
     worktree: Optional[Path],
 ) -> Dict[str, Any]:
+    if state.get("evaluator_rev"):
+        entry.setdefault("evaluator_rev", state["evaluator_rev"])
     append_ledger(task, entry)
     sync_state_from_entry(state, entry)
     if worktree:
@@ -1385,6 +1502,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         if correct:
             state["best_commit"] = base
             state["best_objective"] = objective
+        state["evaluator_rev"], state["evaluator_parts"] = evaluator_fingerprint(task)
         task.write_state(state)
         append_ledger(
             task,
@@ -1400,6 +1518,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "diff_hash": "baseline",
                 "metrics": score.get("metrics", {}),
                 "run_dir": run_relative(task, baseline_dir),
+                "evaluator_rev": state["evaluator_rev"],
             },
         )
     else:
@@ -1424,6 +1543,8 @@ def cmd_tick(args: argparse.Namespace) -> int:
         if not preview and state.get("preview"):
             state["preview"] = False
             task.write_state(state)
+        if not preview:
+            check_evaluator_revision(task, state)
         tick = int(state.get("tick", 0)) + 1
         state["tick"] = tick
         base = head_commit(task.root)
@@ -1438,6 +1559,7 @@ def cmd_tick(args: argparse.Namespace) -> int:
             "worktree": str(worktree),
             "run_dir": run_relative(task, run_dir),
             "agent_model": task.model("driver"),
+            "started_at": now_iso(),
         }
         set_active(task, state, active)
         create_worktree(task, worktree, base)
@@ -1787,8 +1909,168 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Merge an upstream ref into the task branch under the task lock.
+
+    Scheduler wrappers that merged upstream themselves raced interrupted runs and
+    left conflicted checkouts behind. Owning the merge here keeps the transition
+    atomic: recover first, merge cleanly or abort, and record why HEAD moved.
+    """
+    task = Task.from_cwd()
+    with TaskLock(task):
+        state = recover_interrupted(task, task.read_state())
+        require_branch(task, state)
+        require_clean(task)
+        if git(task.root, ["rev-parse", "--verify", "--quiet", args.ref + "^{commit}"], check=False).returncode != 0:
+            raise AvoError("sync: unknown ref {}".format(args.ref))
+        before = head_commit(task.root)
+        # --no-ff: a sync is always a merge commit, so lineage shows exactly where
+        # upstream entered and interrupted-run recovery can recognize it.
+        merged = git(task.root, ["merge", "--no-ff", "--no-edit", args.ref], check=False)
+        if merged.returncode != 0:
+            conflicts = git_text(task.root, ["diff", "--name-only", "--diff-filter=U"]).split()
+            git(task.root, ["merge", "--abort"], check=False)
+            report_event(task, "sync from {} failed: {}".format(args.ref, ", ".join(conflicts) or "merge error"))
+            raise AvoError(
+                "sync: {} does not merge cleanly into {} (conflicts: {}); merge aborted, canonical checkout unchanged".format(
+                    args.ref, state.get("task_branch"), ", ".join(conflicts) or (merged.stderr or "").strip()[:200]
+                )
+            )
+        after = head_commit(task.root)
+        if after == before:
+            info("sync: already up to date with {}".format(args.ref))
+            return 0
+        append_ledger(
+            task,
+            {
+                "tick": state.get("tick", 0),
+                "action": "sync",
+                "note": "merged {} into task branch".format(args.ref),
+                "commit": after,
+                "parent": before,
+                "diff_hash": "sync",
+                "evaluator_rev": state.get("evaluator_rev"),
+            },
+        )
+        info("sync: merged {} ({} -> {})".format(args.ref, (before or "")[:12], (after or "")[:12]))
+        try:
+            check_evaluator_revision(task, state)
+        except AvoError as exc:
+            warn("sync changed the evaluator; next tick will refuse until 'avo rebaseline': {}".format(exc))
+    return 0
+
+
+def cmd_rebaseline(args: argparse.Namespace) -> int:
+    """Rescore HEAD under the current evaluator and make it the comparison point."""
+    task = Task.from_cwd()
+    with TaskLock(task):
+        state = recover_interrupted(task, task.read_state())
+        require_branch(task, state)
+        require_clean(task)
+        if not task.command("score"):
+            raise AvoError("rebaseline needs a scorer; this task is in preview mode")
+        old_rev = state.get("evaluator_rev")
+        old_parts = state.get("evaluator_parts") or {}
+        rev, parts = evaluator_fingerprint(task)
+        head = head_commit(task.root)
+        run_dir = make_run_dir(task, "{:06d}-rebaseline-{}".format(int(state.get("tick", 0)), rev[:8]))
+        info("rebaseline: scoring HEAD {} under evaluator {}".format((head or "")[:12], rev))
+        score, error = score_candidate(task, task.root, run_dir)
+        if error:
+            raise AvoError("rebaseline scoring failed: {}".format(error))
+        assert score is not None
+        if not score["correct"]:
+            raise AvoError(
+                "HEAD fails the correctness gate under evaluator {}; nothing was rebaselined ({})".format(
+                    rev, score.get("note", "")
+                )
+            )
+        previous_best = state.get("best_objective")
+        objective = score.get("objective")
+        changed = changed_evaluator_parts(old_parts, parts)
+        note = "evaluator {} -> {} (changed: {}); previous best {}".format(
+            old_rev, rev, ", ".join(changed) or "none", previous_best
+        )
+        if args.note:
+            note = "{}; {}".format(args.note, note)
+        state.update(
+            {
+                "best_objective": objective,
+                "best_commit": head,
+                "evaluator_rev": rev,
+                "evaluator_parts": parts,
+                "stall": 0,
+                "redirects": 0,
+                "status": "running",
+                "last_action": "rebaseline",
+            }
+        )
+        task.write_state(state)
+        append_ledger(
+            task,
+            {
+                "tick": state.get("tick", 0),
+                "action": "rebaseline",
+                "correct": True,
+                "objective": objective,
+                "note": note,
+                "commit": head,
+                "diff_hash": "rebaseline",
+                "metrics": score.get("metrics", {}),
+                "run_dir": run_relative(task, run_dir),
+                "evaluator_rev": rev,
+            },
+        )
+        report_event(task, "rebaseline: objective={} {}".format(objective, note))
+    info("rebaselined: objective={} under evaluator {}".format(objective, rev))
+    return 0
+
+
+def health_snapshot(task: Task) -> Dict[str, Any]:
+    """Machine-readable liveness and progress for an external monitor."""
+    state = task.read_state()
+    entries = read_ledger(task)
+    attempts = [e for e in entries if e.get("action") in TERMINAL_ACTIONS]
+    accepts = [e for e in entries if e.get("action") == "accept"]
+    active = state.get("active_run") if isinstance(state.get("active_run"), dict) else None
+    try:
+        current_rev, _ = evaluator_fingerprint(task) if task.command("score") else (None, {})
+    except AvoError:
+        current_rev = None
+    return {
+        "task": task.config.get("task"),
+        "branch": current_branch(task.root) or None,
+        "expected_branch": state.get("task_branch"),
+        "mode": task.mode,
+        "status": state.get("status", "running"),
+        "tick": state.get("tick", 0),
+        "best_objective": state.get("best_objective"),
+        "best_commit": state.get("best_commit"),
+        "stall": state.get("stall", 0),
+        "stall_reason": detect_stall(task) or None,
+        "redirects": state.get("redirects", 0),
+        "last_attempt_at": attempts[-1].get("ts") if attempts else None,
+        "last_attempt_action": attempts[-1].get("action") if attempts else None,
+        "last_accept_at": accepts[-1].get("ts") if accepts else None,
+        "consecutive_errors": next(
+            (i for i, e in enumerate(reversed(attempts)) if e.get("action") != "error"), len(attempts)
+        ),
+        "active_run": (
+            {"tick": active.get("tick"), "phase": active.get("phase"), "started_at": active.get("started_at")}
+            if active
+            else None
+        ),
+        "evaluator_rev": state.get("evaluator_rev"),
+        "evaluator_current": current_rev,
+        "evaluator_drift": bool(current_rev and state.get("evaluator_rev") and current_rev != state.get("evaluator_rev")),
+    }
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     task = Task.from_cwd()
+    if getattr(args, "json", False):
+        print(json_dumps(health_snapshot(task)))
+        return 0
     state = task.read_state()
     reason = detect_stall(task)
     print("task branch   : {} (expected {})".format(current_branch(task.root) or "DETACHED", state.get("task_branch")))
@@ -1798,6 +2080,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("best objective: {}".format(state.get("best_objective")))
     print("best commit   : {}".format(state.get("best_commit")))
     print("redirects     : {}".format(state.get("redirects", 0)))
+    if state.get("evaluator_rev"):
+        print("evaluator rev : {}".format(state.get("evaluator_rev")))
     if not task.command("score"):
         print("preview       : yes (no scorer; diffs are saved but never accepted)")
     if state.get("active_run"):
@@ -1885,7 +2169,16 @@ def build_parser() -> argparse.ArgumentParser:
     resume.set_defaults(func=cmd_resume)
 
     status = sub.add_parser("status", help="show task state and recent attempts")
+    status.add_argument("--json", action="store_true", help="print a machine-readable health snapshot")
     status.set_defaults(func=cmd_status)
+
+    sync = sub.add_parser("sync", help="merge an upstream ref into the task branch (aborts cleanly on conflict)")
+    sync.add_argument("ref")
+    sync.set_defaults(func=cmd_sync)
+
+    rebaseline = sub.add_parser("rebaseline", help="rescore HEAD under the current evaluator after an evaluator change")
+    rebaseline.add_argument("--note", default="", help="why the evaluator changed")
+    rebaseline.set_defaults(func=cmd_rebaseline)
 
     report = sub.add_parser("report", help="show redacted noteworthy events")
     report.set_defaults(func=cmd_report)

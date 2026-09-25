@@ -249,7 +249,7 @@ They are deliberately stored in a boring Markdown file: `.avo/pins.md`.
 
 Stagnation is detected without an LLM from terminal attempt ledger entries, including infrastructure errors. A flaky scorer or agent is supposed to stall the search so a human notices; retries and backoff belong in the outer scheduler (cron, systemd, GitHub Actions), not inside `avo run`. The default checks are:
 
-- eight attempts since the last accept, redirect, or human resume (accepts, rejects, and errors all count);
+- eight attempts since the last accept, redirect, human resume, or rebaseline (accepts, rejects, and errors all count);
 - repeated identical diffs in a full cycle window;
 - a high rejection ratio in a full cycle window.
 
@@ -284,13 +284,67 @@ avo pin <text>               add a human pin
 avo pins                     list pins
 avo unpin <number>           remove a pin
 avo resume                   clear stalled state after human intervention
-avo status                   show state and recent ledger entries
+avo status [--json]          show state and recent ledger entries; --json for monitors
+avo sync <ref>               merge an upstream ref into the task branch (aborts cleanly on conflict)
+avo rebaseline [--note T]    rescore HEAD after an intentional evaluator change
 avo report                   show redacted noteworthy events
 ```
 
 Every mutating command uses a local lock. If a process is killed, the next mutating command removes
 the stale worktree and records the interrupted attempt as an error. The small finalization window is
 also recoverable when the accepted Git commit was created before state was written.
+
+## Following an upstream branch
+
+Long-running tasks usually track a moving upstream such as `main`. Let AVO own that merge:
+
+```bash
+git fetch origin && avo sync origin/main && avo tick
+```
+
+`avo sync` takes the task lock, recovers any interrupted run first, and requires a clean checkout.
+It always creates a merge commit and records a `sync` ledger entry, so the lineage shows exactly
+where upstream entered. A conflicting merge is aborted and exits nonzero with the conflicted paths;
+the checkout is left untouched, so the next tick is never built on a half-merged tree.
+
+Merging upstream in a wrapper script before `avo tick` still works, and an interrupted run whose
+base was only advanced by merge commits is recovered normally. Any other unexpected commit still
+stops the loop for inspection.
+
+## Evaluator revisions
+
+Objectives are only comparable when they were produced by the same evaluation contract. AVO
+fingerprints that contract: the score and verify commands, any script files they name, extra paths
+listed in `evaluator.paths`, the mode, `search.min_improvement_abs`, and the kernel's acceptance
+rule. The fingerprint is stored in state and stamped on every ledger entry.
+
+If the fingerprint changes — someone edited the scorer, loosened the margin, or an accepted
+candidate modified an evaluator file — `avo tick` refuses and names what changed. Review the change,
+then:
+
+```bash
+avo rebaseline --note "why the evaluator changed"
+```
+
+This rescores HEAD under the new evaluator, makes it the comparison point, and appends a
+`rebaseline` ledger entry with the old and new revisions and the previous best. HEAD must pass the
+new correctness gate. The rule exists so a loop can never lower its own bar silently: moving the
+goalposts is always an explicit, recorded act.
+
+Only text files are fingerprinted automatically, so interpreter binaries named in a command do not
+count. Add fixtures, data, or compiled tools to `evaluator.paths`:
+
+```json
+{"evaluator": {"paths": ["bench/fixtures", "tools/scorer-bin"]}}
+```
+
+## Health export
+
+`avo status --json` prints one object for schedulers and external monitors: status, tick, best
+objective, stall reason, `last_attempt_at`, `last_accept_at`, consecutive errors, the active run's
+phase and start time, and whether the evaluator has drifted. Alert on progress, not on liveness: a
+loop that runs every hour but has not accepted anything in days, or whose active run started long
+ago, is stuck even though its scheduler reports success.
 
 ## Configuration
 

@@ -245,6 +245,13 @@ AVO evidence and write ordinary files or pins rather than becoming required cont
 - Accepted finalization is recoverable if Git committed before state persistence completed.
 - A bare `avo run` is bounded to 20 ticks; pass `--max-ticks 0` explicitly for an unbounded run.
 - Reports are redacted, but the source ledger is not.
+- `avo sync <ref>` is the way to follow upstream: it merges under the task lock, records a `sync`
+  entry, and aborts cleanly on conflict.
+- Changing the evaluator (scorer or verifier scripts, `evaluator.paths`, the noise margin, or the
+  kernel acceptance rule) blocks ticks until `avo rebaseline` rescores HEAD. Never loosen the bar
+  to manufacture an accept; if the evaluator was wrong, change it deliberately and rebaseline.
+- `avo status --json` is the health export for external monitors; alert on stale
+  `last_accept_at` or a long-running `active_run`, not on scheduler success.
 
 ## Trust boundary
 

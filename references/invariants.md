@@ -60,7 +60,14 @@ eventually halts paid ticks for human review.
 Pins are durable Markdown written through explicit human commands. Driver and supervisor prompts
 receive them before ordinary memory and trajectory context.
 
-## 11. Domain features remain outside the kernel
+## 11. Objectives are compared under one evaluator revision
+
+Every ledger entry carries the evaluator fingerprint that produced it. A tick refuses to rank when
+the scorer, verifier, their scripts, declared evaluator paths, the noise margin, or the kernel's
+acceptance rule have changed since the current best was scored. `avo rebaseline` is the only way
+forward, and it is recorded. A loop that can quietly relax its own acceptance bar is not ratcheting.
+
+## 12. Domain features remain outside the kernel
 
 Planner agents, hypothesis registries, monitoring sentinels, resource dashboards, and research
 profiles should integrate through commands, prompts, and files. They are not prerequisites for a

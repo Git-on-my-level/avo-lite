@@ -332,20 +332,14 @@ class AvoIntegrationTests(unittest.TestCase):
             pathlib.Path(sys.argv[1], "value.txt").write_text("1\\n")
             """,
             """
-            import json, pathlib, sys
+            import json, pathlib, sys, time
             value = int(pathlib.Path(sys.argv[1], "value.txt").read_text())
+            if value == 1:
+                time.sleep(30)  # the same scorer hangs on the candidate only
             print(json.dumps({"correct": True, "objective": value, "metrics": {}, "note": "ok"}))
             """,
         )
-        hung = self.write_python_hook(
-            "hung.py",
-            """
-            import time
-            time.sleep(30)
-            """,
-        )
         config = self.config()
-        config["cmd"]["score"] = str(hung)
         config["search"]["hook_timeout_sec"] = 1
         self.write_config(config)
         started = time.time()
@@ -558,6 +552,169 @@ class AvoIntegrationTests(unittest.TestCase):
         detected = self.avo("stall-detect", check=False)
         self.assertEqual(detected.returncode, 0)
         self.assertIn("stall", detected.stderr.lower() + detected.stdout.lower())
+
+    # ---- upstream sync, evaluator revisions, health export ---------------
+
+    INCREMENT_AGENT = """
+    import pathlib, sys
+    path = pathlib.Path(sys.argv[1], "value.txt")
+    path.write_text(str(int(path.read_text()) + 1) + "\\n")
+    """
+    VALUE_SCORE = """
+    import json, pathlib, sys
+    value = int(pathlib.Path(sys.argv[1], "value.txt").read_text())
+    print(json.dumps({"correct": True, "objective": value, "metrics": {}, "note": f"value={value}"}))
+    """
+
+    def upstream_commit(self, name, content, ref="upstream"):
+        """Advance a separate upstream branch from the task's initial commit."""
+        branch = self.cmd("git", "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        root = self.cmd("git", "rev-list", "--max-parents=0", "HEAD").stdout.split()[0]
+        exists = self.cmd("git", "show-ref", "--verify", "--quiet", "refs/heads/" + ref, check=False).returncode == 0
+        self.cmd("git", "checkout", "-q", ref) if exists else self.cmd("git", "checkout", "-q", "-b", ref, root)
+        self.write(name, content)
+        self.cmd("git", "add", name)
+        self.cmd("git", "commit", "-q", "-m", "upstream: " + name)
+        self.cmd("git", "checkout", "-q", branch)
+
+    def test_sync_merges_upstream_and_records_ledger(self):
+        self.init_value_task(0, self.INCREMENT_AGENT, self.VALUE_SCORE)
+        self.upstream_commit("upstream.txt", "from upstream\n")
+        before = self.cmd("git", "rev-parse", "HEAD").stdout.strip()
+        self.avo("sync", "upstream")
+        self.assertTrue((self.repo / "upstream.txt").exists())
+        entry = self.ledger()[-1]
+        self.assertEqual(entry["action"], "sync")
+        self.assertEqual(entry["parent"], before)
+        self.assertEqual(self.avo("sync", "upstream").returncode, 0)  # idempotent
+        self.assertEqual(self.ledger()[-1]["action"], "sync")
+        self.assertEqual(len([e for e in self.ledger() if e["action"] == "sync"]), 1)
+        self.avo("tick")
+        self.assertEqual(self.ledger()[-1]["action"], "accept")
+
+    def test_sync_conflict_aborts_and_leaves_checkout_clean(self):
+        self.init_value_task(0, self.INCREMENT_AGENT, self.VALUE_SCORE)
+        self.upstream_commit("value.txt", "99\n")
+        self.avo("tick")  # task branch now changes value.txt too
+        head = self.cmd("git", "rev-parse", "HEAD").stdout.strip()
+        result = self.avo("sync", "upstream", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("value.txt", result.stderr)
+        self.assertEqual(self.cmd("git", "rev-parse", "HEAD").stdout.strip(), head)
+        self.assertEqual(self.cmd("git", "status", "--porcelain").stdout, "")
+        self.assertFalse((self.repo / ".git" / "MERGE_HEAD").exists())
+
+    def _mark_interrupted(self, base):
+        state = self.state()
+        state["tick"] = int(state.get("tick", 0)) + 1
+        state["active_run"] = {
+            "tick": state["tick"], "phase": "agent", "base_commit": base,
+            "worktree": str(self.repo / ".avo" / "runs" / "{:06d}".format(state["tick"]) / "worktree"),
+            "run_dir": "runs/{:06d}".format(state["tick"]),
+        }
+        (self.repo / ".avo" / "state.json").write_text(json.dumps(state, indent=2) + "\n")
+        return state["tick"]
+
+    def test_interrupted_run_recovers_when_head_advanced_only_by_merges(self):
+        self.init_value_task(0, self.INCREMENT_AGENT, self.VALUE_SCORE)
+        base = self.cmd("git", "rev-parse", "HEAD").stdout.strip()
+        dead = self._mark_interrupted(base)
+        # A wrapper merged upstream while the run was dead.
+        self.upstream_commit("upstream.txt", "from upstream\n")
+        self.cmd("git", "merge", "-q", "--no-ff", "--no-edit", "upstream")
+        self.avo("tick")
+        entries = self.ledger()
+        interrupted = [e for e in entries if e["tick"] == dead and e["action"] == "error"]
+        self.assertEqual(len(interrupted), 1)
+        self.assertIn("advanced by merge", interrupted[0]["note"])
+        self.assertEqual(entries[-1]["action"], "accept")
+
+    def test_interrupted_run_still_refuses_foreign_single_parent_commit(self):
+        self.init_value_task(0, self.INCREMENT_AGENT, self.VALUE_SCORE)
+        base = self.cmd("git", "rev-parse", "HEAD").stdout.strip()
+        self._mark_interrupted(base)
+        self.write("foreign.txt", "not a merge\n")
+        self.cmd("git", "add", "foreign.txt")
+        self.cmd("git", "commit", "-q", "-m", "someone else")
+        result = self.avo("tick", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected commit", result.stderr)
+
+    def test_evaluator_change_blocks_ticks_until_rebaseline(self):
+        _, score = self.init_value_task(0, self.INCREMENT_AGENT, self.VALUE_SCORE)
+        self.avo("tick")
+        self.assertEqual(self.state()["best_objective"], 1)
+        rev = self.state()["evaluator_rev"]
+        self.assertEqual(self.ledger()[-1]["evaluator_rev"], rev)
+        # Move the goalposts: the scorer now doubles every objective.
+        score.write_text(score.read_text().replace('"objective": value', '"objective": value * 10'))
+        self.cmd("git", "commit", "-q", "-am", "human: rescale objective")
+        result = self.avo("tick", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rebaseline", result.stderr)
+        self.assertIn("file.score", result.stderr)
+        self.assertEqual(self.ledger()[-1]["action"], "accept")  # nothing ran
+        self.avo("rebaseline", "--note", "objective rescaled")
+        entry = self.ledger()[-1]
+        self.assertEqual(entry["action"], "rebaseline")
+        self.assertEqual(entry["objective"], 10)
+        self.assertIn("previous best 1", entry["note"])
+        self.assertNotEqual(self.state()["evaluator_rev"], rev)
+        self.avo("tick")
+        self.assertEqual(self.ledger()[-1]["action"], "accept")
+        self.assertEqual(self.state()["best_objective"], 20)
+
+    def test_acceptance_margin_change_is_an_evaluator_change(self):
+        self.init_value_task(0, self.INCREMENT_AGENT, self.VALUE_SCORE)
+        config = self.config()
+        config["search"]["min_improvement_abs"] = -5  # a looser bar
+        self.write_config(config)
+        result = self.avo("tick", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("min_improvement_abs", result.stderr)
+
+    def test_rebaseline_refuses_when_head_fails_new_gate(self):
+        _, score = self.init_value_task(0, self.INCREMENT_AGENT, self.VALUE_SCORE)
+        score.write_text(score.read_text().replace('"correct": True', '"correct": False'))
+        self.cmd("git", "commit", "-q", "-am", "human: stricter gate")
+        result = self.avo("rebaseline", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("correctness gate", result.stderr)
+        self.assertEqual(self.ledger()[-1]["action"], "baseline")
+
+    def test_interpreter_binary_is_not_part_of_evaluator(self):
+        import sys
+        self.write("value.txt", "0\n")
+        agent = self.write_python_hook("agent.py", self.INCREMENT_AGENT)
+        score = self.write("score.py", self.VALUE_SCORE)
+        self.avo("init", "demo", "--goal", "maximize", "--agent", str(agent),
+                 "--score", "{} {}".format(sys.executable, score))
+        parts = self.state()["evaluator_parts"]
+        self.assertTrue(any(key.endswith("score.py") for key in parts))
+        self.assertFalse(any(sys.executable in key for key in parts))
+
+    def test_legacy_task_without_evaluator_rev_adopts_current(self):
+        self.init_value_task(0, self.INCREMENT_AGENT, self.VALUE_SCORE)
+        state = self.state()
+        state.pop("evaluator_rev")
+        state.pop("evaluator_parts")
+        (self.repo / ".avo" / "state.json").write_text(json.dumps(state, indent=2) + "\n")
+        self.avo("tick")
+        self.assertEqual(self.ledger()[-1]["action"], "accept")
+        self.assertTrue(self.state()["evaluator_rev"])
+
+    def test_status_json_reports_progress(self):
+        self.init_value_task(0, self.INCREMENT_AGENT, self.VALUE_SCORE)
+        self.avo("tick")
+        snapshot = json.loads(self.avo("status", "--json").stdout)
+        self.assertEqual(snapshot["status"], "running")
+        self.assertEqual(snapshot["tick"], 1)
+        self.assertEqual(snapshot["best_objective"], 1)
+        self.assertEqual(snapshot["last_attempt_action"], "accept")
+        self.assertIsNotNone(snapshot["last_accept_at"])
+        self.assertEqual(snapshot["consecutive_errors"], 0)
+        self.assertIsNone(snapshot["active_run"])
+        self.assertFalse(snapshot["evaluator_drift"])
 
 
 if __name__ == "__main__":

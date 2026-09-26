@@ -307,9 +307,11 @@ It always creates a merge commit and records a `sync` ledger entry, so the linea
 where upstream entered. A conflicting merge is aborted and exits nonzero with the conflicted paths;
 the checkout is left untouched, so the next tick is never built on a half-merged tree.
 
-Merging upstream in a wrapper script before `avo tick` still works, and an interrupted run whose
-base was only advanced by merge commits is recovered normally. Any other unexpected commit still
-stops the loop for inspection.
+Merging upstream in a wrapper script before `avo tick` still works. An interrupted run whose base
+was advanced only by commits AVO did not author — human commits made between ticks, or upstream
+merges — is recovered normally: the interrupted tick is recorded as an error and the next tick
+continues from current HEAD. Only an AVO-authored commit the ledger does not account for (a possible
+half-finalized accept) still stops the loop for inspection.
 
 ## Evaluator revisions
 

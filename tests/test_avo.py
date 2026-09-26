@@ -626,16 +626,39 @@ class AvoIntegrationTests(unittest.TestCase):
         entries = self.ledger()
         interrupted = [e for e in entries if e["tick"] == dead and e["action"] == "error"]
         self.assertEqual(len(interrupted), 1)
-        self.assertIn("advanced by merge", interrupted[0]["note"])
+        self.assertIn("advanced by external", interrupted[0]["note"])
         self.assertEqual(entries[-1]["action"], "accept")
 
-    def test_interrupted_run_still_refuses_foreign_single_parent_commit(self):
+    def test_interrupted_run_recovers_when_head_advanced_by_human_commits(self):
         self.init_value_task(0, self.INCREMENT_AGENT, self.VALUE_SCORE)
         base = self.cmd("git", "rev-parse", "HEAD").stdout.strip()
-        self._mark_interrupted(base)
-        self.write("foreign.txt", "not a merge\n")
-        self.cmd("git", "add", "foreign.txt")
-        self.cmd("git", "commit", "-q", "-m", "someone else")
+        dead = self._mark_interrupted(base)
+        # Humans committed on the task branch between ticks, then the tick
+        # died before finalization: recovery must not treat that as damage.
+        self.write("note.txt", "human note\n")
+        self.cmd("git", "add", "note.txt")
+        self.cmd("git", "commit", "-q", "-m", "human note")
+        self.write("note.txt", "second human note\n")
+        self.cmd("git", "commit", "-q", "-am", "human note 2")
+        self.avo("tick")
+        entries = self.ledger()
+        interrupted = [e for e in entries if e["tick"] == dead and e["action"] == "error"]
+        self.assertEqual(len(interrupted), 1)
+        self.assertIn("advanced by external", interrupted[0]["note"])
+        self.assertEqual(entries[-1]["action"], "accept")
+        subjects = self.cmd("git", "log", "--format=%s").stdout.splitlines()
+        self.assertIn("human note", subjects)
+        self.assertIn("human note 2", subjects)
+        self.assertTrue(subjects[0].startswith("avo: tick "))
+
+    def test_interrupted_run_still_refuses_unaccounted_avo_commit(self):
+        self.init_value_task(0, self.INCREMENT_AGENT, self.VALUE_SCORE)
+        base = self.cmd("git", "rev-parse", "HEAD").stdout.strip()
+        dead = self._mark_interrupted(base)
+        # An AVO-authored accept the ledger does not account for (state was
+        # never written) is a possible half-finalization: never guess it away.
+        self.write("value.txt", "1\n")
+        self.cmd("git", "commit", "-q", "-am", "avo: tick {} (correct=true objective=1)".format(dead))
         result = self.avo("tick", check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected commit", result.stderr)

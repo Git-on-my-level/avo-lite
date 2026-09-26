@@ -134,6 +134,34 @@ class AvoIntegrationTests(unittest.TestCase):
         self.assertEqual(self.cmd("git", "rev-parse", "HEAD").stdout.strip(), before)
         self.assertEqual(self.ledger()[-1]["action"], "reject")
 
+
+    def test_capture_survives_embedded_git_repo_left_by_agent(self):
+        self.init_value_task(
+            0,
+            """
+            import pathlib, subprocess, sys
+            root = pathlib.Path(sys.argv[1])
+            root.joinpath("value.txt").write_text("1\\n")
+            # Drivers probe with throwaway repositories; git add -A refuses to
+            # traverse a nested repo whose HEAD has no commit checked out.
+            subprocess.run(
+                ["git", "init", "-q", str(root / ".tmp" / "seg17" / "probe_friend.git")],
+                check=True,
+            )
+            """,
+            """
+            import json, pathlib, sys
+            value = int(pathlib.Path(sys.argv[1], "value.txt").read_text())
+            print(json.dumps({"correct": True, "objective": value, "metrics": {}, "note": f"value={value}"}))
+            """,
+        )
+        result = self.avo("tick")
+        self.assertIn("probe_friend.git", result.stderr)
+        self.assertEqual(self.ledger()[-1]["action"], "accept")
+        self.assertEqual((self.repo / "value.txt").read_text(), "1\n")
+        self.assertEqual(self.cmd("git", "status", "--porcelain").stdout, "")
+        self.assertFalse((self.repo / ".tmp").exists())
+
     def test_incorrect_score_may_have_null_objective(self):
         self.init_value_task(
             0,

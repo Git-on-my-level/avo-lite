@@ -696,11 +696,69 @@ def cleanup_orphan_worktrees(task: Task, active_path: Optional[str] = None) -> N
         remove_worktree(task, path)
 
 
+# git refuses to traverse a nested repository whose HEAD has no commit checked
+# out, which aborts `git add -A` (exit 128) and would lose the whole tick.
+EMBEDDED_REPO_ERROR = re.compile(r"^error: '(.*)/' does not have a commit checked out$", re.MULTILINE)
+
+
+def is_repo_dir(path: Path) -> bool:
+    return bool((path / ".git").exists()) or (
+        (path / "HEAD").is_file() and (path / "refs").exists() and (path / "objects").exists()
+    )
+
+
+def remove_embedded_repos(candidate: Path, names: Sequence[str]) -> List[str]:
+    """Delete embedded repositories git add refused to traverse.
+
+    The names come from git's own error output, but only directories inside
+    the candidate that really are repositories (a checkout with .git inside,
+    or a bare gitdir) are removed. Returns what was actually deleted.
+    """
+    root = candidate.resolve()
+    removed: List[str] = []
+    for name in names:
+        target = candidate / name
+        try:
+            target.resolve().relative_to(root)
+        except ValueError:
+            continue
+        if not target.is_dir() or not is_repo_dir(target):
+            continue
+        shutil.rmtree(str(target), ignore_errors=True)
+        if not target.exists():
+            removed.append(name)
+    return removed
+
+
+def stage_candidate(candidate: Path) -> List[str]:
+    """Stage the whole candidate tree (git add -A), tolerating driver scratch.
+
+    An agent that clones or inits a repository inside the worktree leaves a
+    directory git add cannot traverse. Such a directory can never become
+    candidate content, so remove it, say so, and retry instead of losing the
+    tick. Any other add failure propagates unchanged.
+    """
+    removed: List[str] = []
+    while True:
+        result = git(candidate, ["add", "-A"], check=False)
+        if result.returncode == 0:
+            break
+        offenders = EMBEDDED_REPO_ERROR.findall(result.stderr or "")
+        cleaned = remove_embedded_repos(candidate, offenders) if offenders else []
+        if not cleaned:
+            git(candidate, ["add", "-A"])
+            break
+        removed.extend(cleaned)
+    if removed:
+        warn("removed embedded git repos left in candidate: {}".format(", ".join(removed)))
+    return removed
+
+
 def build_patch(
     candidate: Path, base_commit: str, patch_path: Path, exclude_paths: Sequence[str] = ()
-) -> Tuple[str, bool]:
+) -> Tuple[str, bool, List[str]]:
     git(candidate, ["reset", "--soft", base_commit])
-    git(candidate, ["add", "-A"])
+    removed = stage_candidate(candidate)
     # Runtime knowledge is context, never candidate output. This remains true even
     # when AVO_HOME lives outside the repository and therefore cannot be excluded
     # by the canonical worktree's local exclude file.
@@ -709,7 +767,7 @@ def build_patch(
     result = git(candidate, ["diff", "--cached", "--binary", "--full-index", base_commit], capture=True)
     data = result.stdout.encode("utf-8", errors="surrogateescape")
     patch_path.write_bytes(data)
-    return hashlib.sha256(data).hexdigest()[:16], bool(data)
+    return hashlib.sha256(data).hexdigest()[:16], bool(data), removed
 
 
 def candidate_changed_paths(candidate: Path, base_commit: str) -> set:
@@ -1588,7 +1646,9 @@ def cmd_tick(args: argparse.Namespace) -> int:
             active["agent_rc"] = result.returncode
             active["phase"] = "capturing"
             set_active(task, state, active)
-            diff_hash, has_diff = build_patch(worktree, base, run_dir / "diff.patch")
+            diff_hash, has_diff, removed_repos = build_patch(worktree, base, run_dir / "diff.patch")
+            if removed_repos:
+                report_event(task, "tick {}: capture removed embedded git repos: {}".format(tick, ", ".join(removed_repos)))
             initial_paths = sorted(candidate_changed_paths(worktree, base))
             active["diff_hash"] = diff_hash
             set_active(task, state, active)
